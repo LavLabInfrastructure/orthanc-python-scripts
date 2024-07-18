@@ -1,3 +1,4 @@
+import os
 import orthanc
 from config import Config
 from excel import ExcelClient
@@ -5,7 +6,7 @@ from processor import DicomProcessor
 from callback import OrthancCallbackHandler
 
 def main():
-    config = Config()
+    config = Config(os.environ.get('ORTHANC_PYTHON_SCRIPTS_YAML', 'config.yaml'))
     excel_client = ExcelClient(config)
     dicom_processor = DicomProcessor(config)
     callback_handler = OrthancCallbackHandler(config, dicom_processor, excel_client)

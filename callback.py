@@ -1,6 +1,5 @@
 import io
 import json
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pydicom

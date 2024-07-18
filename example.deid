@@ -1,0 +1,32 @@
+# example.deid:v1.0.0
+FORMAT dicom
+%header
+
+ADD PatientIdentityRemoved YES
+ADD DeidentificationMethod example.deid:v1.0.0
+
+KEEP ContentDate
+KEEP StudyDate
+
+REPLACE PatientName var:excel_id
+REPLACE PatientID var:excel_id
+REPLACE AccessionNumber func:hash_func
+REPLACE AdmissionID func:hash_func
+REPLACE InterpretationID func:hash_func
+REPLACE PerformedProcedureStepID func:hash_func
+REPLACE PerformingPhysicianName func:hash_func
+REPLACE RequestedProcedureID func:hash_func
+REPLACE ResultsID func:hash_func
+REPLACE StudyID func:hash_func
+REPLACE PatientBirthDate func:remove_day
+REPLACE StudyInstanceUID func:hash_uid_func
+REPLACE SeriesInstanceUID func:hash_uid_func
+REPLACE PatientComments func:format_xnat_route
+
+# Tags that require custom regex expressions
+# Curve Data"(50xx,xxxx)"
+REMOVE contains:^50.{6}$
+# Overlay comments and data (60xx[34]000)
+REMOVE contains:^60.{2}[34]000$
+# Private tags ggggeeee where gggg is odd
+REMOVE contains:^.{3}[13579].{4}$

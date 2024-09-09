@@ -1,31 +1,36 @@
 orthanc:
-  xnat_ip: "XNAT_IP_ADDRESS"
-  xnat_port: 104
-  ae_title: "YOUR_AE_TITLE"
-  xnat_ae_title: "XNAT_AE_TITLE"
+  xnat_ip: "XNAT_IP"
+  xnat_port: 8184
+  ae_title: "ORTHANC"
+  xnat_ae_title: "XNAT"
   deid:
     recipe_paths: # can also be a string
-      - "deid_recipe.txt"
-    use_base_recipe: True
+      - "/python/example.deid"
+    use_base_recipe: true
 
 sheets:
-  - name: "Sheet1"
+  - name: "BrainMasterKey"
     identifiers:
-      - regex: "regex_pattern1"
-        tag: "0008,1030"  # Study Description
-    drive_id: "DRIVE_ID1"
-    file_id: "FILE_ID1"
-    worksheet_id: "WORKSHEET_ID1"
-    xnat_project: "XNAT_PROJECT1"
+      - regex: ".*((?i:brain)|(?i:head)|(?i:rcbv)|(?i:spine)|(?i:sinus)|(?i:shoulder)|(?i:spectroscopy)).*"
+        tag: "StudyDescription"
+      - regex: ".*((?i:brain)).*"
+        tag: "ReceiveCoilName"
+      - regex: ".*((?i:brain)|(?i:spine)).*"
+        tag: "BodyPartExamined"
+    drive_id: "DRIVE_ID"
+    file_id: "FILE_ID"
+    worksheet_id: "WORKSHEET_ID"
+    xnat_project: "BRAIN"
     format: "{}" # this.format(PatientID)
-  - name: "Sheet2"
+  - name: "ProstateMasterKey"
     identifiers:
-      - regex: "regex_pattern2"
-        tag: "0010,0010"  # Patient Name
-    drive_id: "DRIVE_ID2"
-    file_id: "FILE_ID2"
-    worksheet_id: "WORKSHEET_ID2"
-    xnat_project: "XNAT_PROJECT2"
+      - regex: ".*((?i:prostate)|(?i:pelvis)|(?i:body)).*"
+        tag: "StudyDescription"
+    drive_id: "DRIVE_ID"
+    file_id: "FILE_ID"
+    worksheet_id: "WORKSHEET_ID"
+    xnat_project: "PROSTATE"
+    format: "{}" # this.format(PatientID)
 microsoft:
   idp_url: "https://login.microsoftonline.com"
   tenant_id: "TENANT_ID"

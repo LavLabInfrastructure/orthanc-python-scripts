@@ -1,0 +1,72 @@
+{
+    "Name": "Orthanc",
+    "RemoteAccessAllowed": true,
+    "SslEnabled": false,
+    "AuthenticationEnabled": false,
+    "DicomServerEnabled": true,
+    "DicomAet": "TEST",
+    "Python": {
+        "Path": "/python/lavlab-plugin.py",
+        "Verbose": true,
+        "LogLevel": "debug"
+    },
+    "DicomPort": 4242,
+    "DicomTlsEnabled": false,
+    "DicomTlsRemoteCertificateRequired": false,
+    "PostgreSQL": {
+        "EnableIndex": true,
+        "EnableStorage": true,
+        "Host": "postgres",
+        "Port": 5432,
+        "Database": "orthanc",
+        "Username": "${POSTGRES_USER}",
+        "Password": "${POSTGRES_PASSWORD}",
+        "EnableSsl": false,
+        "Lock": false
+    },
+    "DicomWeb": {
+        "Enable": true,
+        "Root": "/dicom-web/",
+        "EnableWado": true,
+        "WadoRoot": "/wado",
+        "Ssl": false,
+        "Host": "http://localhost:8080",
+        "QidoCaseSensitive": true,
+        "StudiesMetadata": "Full",
+        "SeriesMetadata": "Full",
+        "EnableMetadataCache": true,
+        "MetadataWorkerThreadsCount": 4
+    },
+    "OHIF": {
+        "DataSource": "dicom-json"
+    },
+    "OrthancExplorer2": {
+        "Enable": true,
+        "IsDefaultOrthancUI": true,
+        "UiOptions": {
+            "EnableShares": false,
+            "DefaultShareDuration": 0,
+            "ShareDurations": [
+                0,
+                7,
+                15,
+                30,
+                90,
+                365
+            ],
+            "EnableOpenInOhifViewer3": true,
+            "OhifViewer3PublicRoot": "http://localhost:8080/ohif/"
+        },
+        "Tokens": {
+            "InstantLinksValidity": 36000,
+            "ShareType": "ohif-viewer-publication"
+        }
+    },
+    "Plugins": [
+        "/usr/share/orthanc/plugins-available/libOrthancPostgreSQLIndex.so",
+        "/usr/share/orthanc/plugins-available/libOrthancOHIF.so",
+        "/usr/share/orthanc/plugins-available/libOrthancDicomWeb.so",
+        "/usr/share/orthanc/plugins-available/libOrthancExplorer2.so",
+        "/usr/share/orthanc/plugins-available/libOrthancPython.so"
+    ]
+}

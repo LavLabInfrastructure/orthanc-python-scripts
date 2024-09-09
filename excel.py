@@ -5,7 +5,7 @@ from urllib.parse import urljoin
 
 import requests
 
-import orthanc
+import orthanc  # pylint: disable=import-error
 from config import Config
 
 class ExcelClient:

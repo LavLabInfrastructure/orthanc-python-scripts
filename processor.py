@@ -10,9 +10,11 @@ import pydicom.sequence
 from deid.config import DeidRecipe
 from deid.dicom.parser import DicomParser
 
-import orthanc
+import orthanc  # pylint: disable=import-error
+
 from config import Config
 
+# pylint: disable=unused-argument
 class DicomProcessor:
     """Handles de-identification of DICOM datasets."""
     def __init__(self, config: Config):
@@ -142,7 +144,7 @@ class DicomProcessor:
 
         base32_hash = base64.b32encode(truncated_hash_bytes).decode('utf-8').rstrip('=')
 
-        numeric_uid = ''.join(str(ord(c) - ord('A') + 10) if 'A' <= c <= 'Z' else c for c in base32_hash)
+        numeric_uid = ''.join(str(ord(c) - ord('A') + 10) if 'A' <= c <= 'Z' else c for c in base32_hash)  # pylint: disable=line-too-long
 
         max_numeric_length = 64 - len(namespace) - 1
         numeric_uid = numeric_uid[:max_numeric_length]

@@ -1,3 +1,4 @@
+"""Defines OrthancCallbackHandler which handles callbacks for the Orthanc plugin."""
 import io
 import json
 import threading
@@ -9,14 +10,16 @@ import pydicom.errors
 from pynetdicom import AE, StoragePresentationContexts
 from pynetdicom.association import Association
 
-import orthanc
+import orthanc  # pylint: disable=import-error
 from config import Config
 from processor import DicomProcessor
 from excel import ExcelClient
 
+# pylint: disable=unused-argument
 class OrthancCallbackHandler:
+    """Handles callbacks for the Orthanc plugin."""
     def __init__(self, config: Config, dicom_processor: DicomProcessor, excel_client: ExcelClient):
-        """Initialize the OrthancCallbackHandler with the given configuration, DICOM processor, and Excel client."""
+        """Initialize the object with the given configuration, DICOM processor, and Excel client."""
         orthanc_config = config.get_orthanc_config()
         self.xnat_ip = orthanc_config['xnat_ip']
         self.xnat_port = orthanc_config['xnat_port']
@@ -30,21 +33,21 @@ class OrthancCallbackHandler:
         ae = AE(self.ae_title)
         ae.requested_contexts = StoragePresentationContexts
         assoc: Association = ae.associate(self.xnat_ip, self.xnat_port, ae_title=self.xnat_ae_title)
-        
+
         if assoc.is_established:
             status = assoc.send_c_store(ds)
             assoc.release()
             if status:
-                orthanc.LogInfo(f'Successfully sent DICOM file to XNAT')
+                orthanc.LogInfo('Successfully sent DICOM file to XNAT')
             else:
-                orthanc.LogError(f'Failed to send DICOM file to XNAT')
+                orthanc.LogError('Failed to send DICOM file to XNAT')
         else:
-            orthanc.LogError(f'Failed to associate with XNAT')
+            orthanc.LogError('Failed to associate with XNAT')
 
     def process_instance(self, instance: Union[orthanc.DicomInstance, str]) -> None:
         """Process a new DICOM instance by de-identifying and sending it to XNAT."""
         orthanc.LogError(f"Processing instance {instance}")
-            
+
         dcm_bytes = None
         if isinstance(instance, str):
             dcm_bytes = orthanc.GetDicomForInstance(instance)
@@ -60,13 +63,13 @@ class OrthancCallbackHandler:
         if ds is None:
             orthanc.LogError(f'Could not get DICOM dataset for instance {instance}')
             return
-            
+
         sheet = self.dicom_processor.match_dicom_to_sheet(ds)
         key = sheet["format"].format(ds.get('PatientID'))
         new_patient_id = self.excel_client.get_patient_id(key, sheet)
         if key == new_patient_id:
             orthanc.LogError(f"Could not replace identifier for id: {ds.get('PatientID')}")
-        
+
         deidentified_ds = self.dicom_processor.deidentify_dicom(ds, new_patient_id)
         orthanc.LogInfo(f'Re-identified DICOM with new patient ID: {new_patient_id}')
         self.send_to_xnat(deidentified_ds)

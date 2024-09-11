@@ -29,8 +29,8 @@ class ExcelClient:
         self.access_token = None
         self.token_expires_at = None
         self.cache = {}
-        for sheet in config.get_sheets().values():
-            self.cache.update({sheet['drive_id']+sheet['file_id']+sheet['worksheet_id']: []})
+        for sheet in config.get_sheets():
+            self.cache.update({sheet['drive_id']+sheet['file_id']+sheet['worksheet_id']: {}})
 
     def get_access_token(self) -> str:
         """Get an access token from the Microsoft Graph API."""

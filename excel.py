@@ -28,19 +28,25 @@ class ExcelClient:
         self.graph_root_url = microsoft_config['graph_root_url']
         self.access_token = None
         self.token_expires_at = None
+        self.cache = {}
+        for sheet in config.get_sheets().values():
+            self.cache.update({sheet['drive_id']+sheet['file_id']+sheet['worksheet_id']: []})
 
     def get_access_token(self) -> str:
         """Get an access token from the Microsoft Graph API."""
         if (self.access_token is None or
             self.token_expires_at is None or
             self.token_expires_at <= time()):
-            response = requests.post(self.token_url, data=self.token_body, timeout=10).json()
+            response = requests.post(self.token_url, data=self.token_body, timeout=30).json()
             self.access_token = response["access_token"]
             self.token_expires_at = time() + response["expires_in"] - 60
         return self.access_token
 
     def get_patient_id(self, key: str, sheet: dict[str, Any]) -> str:
         """Get the patient ID from the specified sheet using the provided key."""
+        cache_key = sheet['drive_id']+sheet['file_id']+sheet['worksheet_id']
+        if key in self.cache[cache_key]:
+            return self.cache[cache_key][key]
         drive_id = sheet['drive_id']
         file_id = sheet['file_id']
         worksheet_id = sheet['worksheet_id']
@@ -54,6 +60,7 @@ class ExcelClient:
             patient_id = response["text"]
             while isinstance(patient_id, list):
                 patient_id = patient_id[0]
+            self.cache[cache_key].update({key: patient_id})
             return patient_id
         except KeyError:
             orthanc.LogError(f"Failed to retrieve patient ID for key {key}: {response}")

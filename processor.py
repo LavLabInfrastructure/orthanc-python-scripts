@@ -106,10 +106,6 @@ class DicomProcessor:
         if not handler:
             raise ValueError(f"Unsupported or unknown manufacturer: {manufacturer}")
 
-        # Create MR Diffusion Sequence if it doesn't exist
-        if 'MRDiffusionSequence' not in dicom:
-            dicom.MRDiffusionSequence = [pydicom.Dataset()]
-
         # Call the handler function to get DiffusionSequence
         return handler(dicom)
 
@@ -197,7 +193,7 @@ class DicomProcessor:
             value = ds[(0x0019, 0x1027)].value
             # should really be 6, hopefully this never hits
             if len(value) is not 6:
-                return
+                return None
             # decode bmatrix into their appropriate tags
             _tags = pydicom.Dataset()
             tag = 0x9602
@@ -214,7 +210,7 @@ class DicomProcessor:
         tags = pydicom.Dataset()
         #bval
         if (0x0043,0x1039) in ds:
-            value = int(ds[(0x0019, 0x100C)].value[0])
+            value = int(ds[(0x0043, 0x1039)].value[0])
             if value > 10000:
                 value = value % 100000 #god GE is so annoying
             tags.add_new((0x0018,0x9087), 'FD', value)

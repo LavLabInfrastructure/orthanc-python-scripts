@@ -4,10 +4,6 @@ import sys
 
 import orthanc  # pylint: disable=import-error
 
-from config import Config
-from excel import ExcelClient
-from processor import DicomProcessor
-from callback import OrthancCallbackHandler
 
 # add the current directory to sys.path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +33,13 @@ def add_venv_to_path():
     sys.path.append(site_packages)
     orthanc.LogInfo(f"Added {site_packages} to sys.path")
 add_venv_to_path()
+
+# need to import after adding the virtual environment to sys.path
+# pylint: disable=wrong-import-position
+from config import Config
+from excel import ExcelClient
+from processor import DicomProcessor
+from callback import OrthancCallbackHandler
 
 config = Config(os.environ.get('ORTHANC_PYTHON_SCRIPTS_YAML', 'config.yaml'))
 excel_client = ExcelClient(config)

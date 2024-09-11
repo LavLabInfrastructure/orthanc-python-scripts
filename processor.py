@@ -37,7 +37,8 @@ class DicomProcessor:
         parser.define('gather_diffusion_tags', self.gather_diffusion_tags)
         parser.define('round_func', self.deid_round_func)
 
-        parser.parse(strip_sequences=False, remove_private=True)
+        parser.parse(strip_sequences=False, remove_private=False)
+        parser.remove_private()
         return parser.dicom
 
     def format_xnat_route_antiphi(self, item, value, field, dicom):
@@ -192,7 +193,7 @@ class DicomProcessor:
         if (0x0019, 0x1027) in ds:
             value = ds[(0x0019, 0x1027)].value
             # should really be 6, hopefully this never hits
-            if len(value) is not 6:
+            if len(value) != 6:
                 return None
             # decode bmatrix into their appropriate tags
             _tags = pydicom.Dataset()

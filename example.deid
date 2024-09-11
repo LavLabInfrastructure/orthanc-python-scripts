@@ -36,7 +36,7 @@ REPLACE StudyInstanceUID func:hash_uid_func
 REPLACE SeriesInstanceUID func:hash_uid_func
 ADD PatientComments quickAssurance
 REPLACE PatientComments func:format_xnat_route_antiphi
-REPLACE MRDiffusionSequence func:gather_diffusion_tags
+ADD MRDiffusionSequence func:gather_diffusion_tags
 
 # remove station name
 REMOVE StationName

@@ -99,9 +99,9 @@ class DicomProcessor:
 
     def gather_diffusion_tags(self, item, value, field, dicom) -> pydicom.Dataset:
         """Gathers relevant diffusion info and formats into an MRDiffusionSequence."""
-        if ('Diffusion' not in dicom.SeriesDescription or
-            'DWI' not in dicom.SeriesDescription or
-            'ADC' in dicom.SeriesDescription):
+        desc = str(dicom.SeriesDescription).lower()
+        if ('diffusion' not in desc or 'dwi' not in desc or
+            'adc' in desc or 'apparent diffusion coefficient' in desc):
             return None
         manufacturer = dicom.Manufacturer.upper() if 'Manufacturer' in dicom else None
         if not manufacturer:

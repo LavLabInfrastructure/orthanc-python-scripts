@@ -10,7 +10,10 @@ import pydicom.sequence
 from deid.config import DeidRecipe
 from deid.dicom.parser import DicomParser
 
-import orthanc  # pylint: disable=import-error
+# orthanc doesn't have a pypi package, so pylance complains about the import, works fine at runtime
+# if you want autocomplete, add orthanc.pyi to the directory, downloaded from the link below
+# https://orthanc.uclouvain.be/downloads/cross-platform/orthanc-python/index.html
+import orthanc  #type: ignore # pylint: disable=import-error
 
 from config import Config
 

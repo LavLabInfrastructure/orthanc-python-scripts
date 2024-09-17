@@ -5,7 +5,7 @@ from urllib.parse import urljoin
 
 import requests
 
-import orthanc  # pylint: disable=import-error
+import orthanc  #type: ignore # pylint: disable=import-error
 from config import Config
 
 class ExcelClient:
@@ -42,26 +42,53 @@ class ExcelClient:
             self.token_expires_at = time() + response["expires_in"] - 60
         return self.access_token
 
-    def get_patient_id(self, key: str, sheet: dict[str, Any]) -> str:
-        """Get the patient ID from the specified sheet using the provided key."""
-        cache_key = sheet['drive_id']+sheet['file_id']+sheet['worksheet_id']
-        if key in self.cache[cache_key]:
-            return self.cache[cache_key][key]
-        drive_id = sheet['drive_id']
-        file_id = sheet['file_id']
-        worksheet_id = sheet['worksheet_id']
-        mapper_url = urljoin(self.graph_root_url, f"/v1.0/drives/{drive_id}/items/{file_id}/workbook/worksheets/{worksheet_id}/range(address='_{key}')") # pylint: disable=line-too-long
+    def _excel_request(self, url: str) -> Any:
+        """Make a request to the Microsoft Graph API for Excel."""
         response = requests.get(
-            mapper_url,
+            url,
             headers={"Authorization": f"Bearer {self.get_access_token()}"},
-            timeout=10
+            timeout=20
         ).json()
         try:
             patient_id = response["text"]
             while isinstance(patient_id, list):
                 patient_id = patient_id[0]
+        except KeyError:
+            orthanc.LogError(f"Failed to retrieve patient ID: {response}")
+            return None
+        return patient_id
+
+
+    def get_patient_id(self, key: str, sheet: dict[str, Any], alt_keys = None) -> str:
+        """Get the patient ID from the specified sheet using the provided key."""
+        if alt_keys is None:
+            alt_keys = []
+
+        cache_key = sheet['drive_id']+sheet['file_id']+sheet['worksheet_id']
+        if key in self.cache[cache_key]:
+            return self.cache[cache_key][key]
+        for alt_key in alt_keys:
+            if alt_key in self.cache[cache_key]:
+                return self.cache[cache_key][alt_key]
+
+        drive_id = sheet['drive_id']
+        file_id = sheet['file_id']
+        worksheet_id = sheet['worksheet_id']
+        mapper_url = urljoin(self.graph_root_url, f"/v1.0/drives/{drive_id}/items/{file_id}/workbook/worksheets/{worksheet_id}/range(address='_{key}')")  # pylint: disable=line-too-long
+        patient_id = self._excel_request(mapper_url)
+
+        if patient_id is not None and patient_id != key:
             self.cache[cache_key].update({key: patient_id})
             return patient_id
-        except KeyError:
-            orthanc.LogError(f"Failed to retrieve patient ID for key {key}: {response}")
-            return key  # Fallback to original key if retrieval fails
+        for alt_key in alt_keys:
+            mapper_url = urljoin(self.graph_root_url, f"/v1.0/drives/{drive_id}/items/{file_id}/workbook/worksheets/{worksheet_id}/range(address='_{alt_key}')")  # pylint: disable=line-too-long
+            patient_id = self._excel_request(mapper_url)
+            if alt_key == patient_id:
+                orthanc.LogError("Alli")
+                continue
+            self.cache[cache_key].update({key: patient_id})
+            orthanc.LogError("Alla")
+            return patient_id
+
+        orthanc.LogError(f"Failed to retrieve patient ID for key: {key}")
+        return key

@@ -10,7 +10,7 @@ import pydicom.errors
 from pynetdicom import AE, StoragePresentationContexts
 from pynetdicom.association import Association
 
-import orthanc  # pylint: disable=import-error
+import orthanc  # type: ignore # pylint: disable=import-error
 from config import Config
 from processor import DicomProcessor
 from excel import ExcelClient
@@ -65,8 +65,14 @@ class OrthancCallbackHandler:
             return
 
         sheet = self.dicom_processor.match_dicom_to_sheet(ds)
-        key = sheet["format"].format(ds.get('PatientID'))
-        new_patient_id = self.excel_client.get_patient_id(key, sheet)
+        formatting = sheet.get("format", "{}")
+        key = formatting.format(ds.get('PatientID'))
+        alt_keys = [formatting.format(id) for id in ds.get('OtherPatientIDs')]
+        if not alt_keys:
+            orthanc.LogError("AQUI")
+            alt_keys = [formatting.format(id) for id in ds.get('RETIRED_OtherPatientIDs')]
+        orthanc.LogError(str(alt_keys))
+        new_patient_id = self.excel_client.get_patient_id(key, sheet, alt_keys)
         if key == new_patient_id:
             orthanc.LogError(f"Could not replace identifier for id: {ds.get('PatientID')}")
 
@@ -81,6 +87,7 @@ class OrthancCallbackHandler:
         # self.process_instance(instance_id)
 
     def on_series_sync_call(self, output:orthanc.RestOutput, uri, **request):
+        """Rest API callback function to sync a series to XNAT."""
         orthanc.LogError(f'Syncing series: {request}')
         series_id = request.get('get', {}).get('id')
         if series_id is None:
@@ -91,7 +98,7 @@ class OrthancCallbackHandler:
             return output.SendHttpStatusCode(404)
         except json.JSONDecodeError:
             return output.SendHttpStatusCode(500)
-        
+
         instances = series_response.get('instances', [])
         with ThreadPoolExecutor(4) as tpe:
             tpe.map(self.process_instance, instances)

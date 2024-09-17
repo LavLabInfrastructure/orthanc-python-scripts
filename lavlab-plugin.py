@@ -2,7 +2,7 @@
 import os
 import sys
 
-import orthanc  # pylint: disable=import-error
+import orthanc  #type: ignore # pylint: disable=import-error
 
 
 # add the current directory to sys.path

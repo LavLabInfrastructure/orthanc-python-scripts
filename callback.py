@@ -106,6 +106,8 @@ class OrthancCallbackHandler:
 
     def on_all_sync_call(self, output, uri, **request):
         instances = json.loads(orthanc.RestApiGet('/instances'))
-        with ThreadPoolExecutor(4) as tpe:
-            tpe.map(self.process_instance, instances)
+        def work(instances):
+            with ThreadPoolExecutor(4) as tpe:
+                tpe.map(self.process_instance, instances)
+        threading.Thread(target=work, args=(instances,)).start()
         return output.SendHttpStatusCode(200)

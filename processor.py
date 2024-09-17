@@ -55,11 +55,10 @@ class DicomProcessor:
         # logic to remove icky stuff
         modality = dicom.get('Modality')
         if modality == "KO" or modality == "SR":
-            sesh = "PROBABLE_PHI"
+            return "Project: NA Subject: HIDDEN Session: PROBABLE_PHI"
         elif dicom.get("ConversionType") is not None:
-            sesh = "PROBABLE_PHI"
-        else:
-            sesh = f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
+            return "Project: NA Subject: HIDDEN Session: PROBABLE_PHI"
+        sesh = f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
 
         return f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
 

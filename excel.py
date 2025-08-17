@@ -214,3 +214,18 @@ class ExcelClient:
         with self._lock:
             self.cache[cache_key].setdefault(key, key)
         return key
+
+    def set_mapping(
+        self, sheet: dict[str, Any], keys: list[str], patient_id: str
+    ) -> None:
+        """Seed the cache for a given sheet with a mapping for multiple keys."""
+        cache_key = sheet["drive_id"] + sheet["file_id"] + sheet["worksheet_id"]
+        with self._lock:
+            sheet_cache = self.cache.setdefault(cache_key, {})
+            for k in keys:
+                if not isinstance(k, str):
+                    try:
+                        k = str(k)
+                    except Exception:  # pylint: disable=broad-except
+                        continue
+                sheet_cache[k] = patient_id

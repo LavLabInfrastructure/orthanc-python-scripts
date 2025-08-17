@@ -3,7 +3,7 @@
 import io
 import json
 import threading
-from typing import Union, List
+from typing import Union, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 import pydicom
@@ -38,6 +38,9 @@ class OrthancCallbackHandler:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         # Ensure only one /sync-all runs at a time
         self._sync_all_lock = threading.Lock()
+        # Pending queue: map of ID -> set(instance_id) awaiting discovered mapping
+        self._pending_lock = threading.RLock()
+        self._pending_by_id: dict[str, set[str]] = {}
 
     def send_to_xnat(self, ds: pydicom.Dataset) -> None:
         """Send the DICOM dataset to XNAT using C-STORE."""
@@ -109,9 +112,58 @@ class OrthancCallbackHandler:
                 unique.append(c)
         return unique
 
+    def _queue_pending_instance(
+        self, ids: List[str], instance_id: Optional[str]
+    ) -> None:
+        """Queue this instance to be retried later when a mapping is discovered for any of the given ids."""
+        if not instance_id:
+            # If we don't have a stable string id, we cannot re-fetch later
+            orthanc.LogWarning(
+                "Instance has no string ID; cannot queue for retry without mapping"
+            )
+            return
+        with self._pending_lock:
+            for pid in ids:
+                try:
+                    pid = str(pid)
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                s = self._pending_by_id.get(pid)
+                if s is None:
+                    s = set()
+                    self._pending_by_id[pid] = s
+                s.add(instance_id)
+        orthanc.LogInfo(
+            f"Queued instance {instance_id} for retry; awaiting mapping for IDs: {ids}"
+        )
+
+    def _flush_pending_for_ids(self, ids: List[str]) -> None:
+        """Re-schedule any pending instances that share any of these ids now that a mapping is known."""
+        to_retry: set[str] = set()
+        with self._pending_lock:
+            for pid in ids:
+                pid_str = str(pid)
+                instances = self._pending_by_id.pop(pid_str, None)
+                if instances:
+                    to_retry.update(instances)
+        if to_retry:
+            orthanc.LogInfo(
+                f"Discovered mapping; retrying {len(to_retry)} pending instance(s)"
+            )
+            for inst_id in to_retry:
+                try:
+                    self.executor.submit(self.process_instance, inst_id)
+                except Exception as exc:  # pylint: disable=broad-except
+                    orthanc.LogError(
+                        f"Failed to resubmit pending instance {inst_id}: {exc}"
+                    )
+
     def process_instance(self, instance: Union[orthanc.DicomInstance, str]) -> None:
         """Process a new DICOM instance by re-identifying and sending it to XNAT."""
         try:
+            instance_id_str: Optional[str] = (
+                instance if isinstance(instance, str) else None
+            )
             if isinstance(instance, str):
                 dcm_bytes = orthanc.GetDicomForInstance(instance)
             else:
@@ -144,12 +196,21 @@ class OrthancCallbackHandler:
             alt_keys = [formatting.format(i) for i in all_ids[1:]]
 
             new_patient_id = self.excel_client.get_patient_id(key, sheet, alt_keys)
-            if not new_patient_id:
-                new_patient_id = key
-            if key == new_patient_id:
+            if not new_patient_id or key == new_patient_id:
+                # No mapping yet; queue for retry and return without sending
+                self._queue_pending_instance(all_ids, instance_id_str)
                 orthanc.LogWarning(
-                    f"No mapping found for PatientID: {ds.get('PatientID')}"
+                    f"No mapping found yet for IDs {all_ids}; queued instance for retry"
                 )
+                return
+
+            # Mapping discovered; seed cache for all observed IDs and retry any pending
+            try:
+                formatted_ids = [formatting.format(i) for i in all_ids if i]
+                self.excel_client.set_mapping(sheet, formatted_ids, new_patient_id)
+            except Exception:  # pylint: disable=broad-except
+                pass
+            self._flush_pending_for_ids(all_ids)
 
             deidentified_ds = self.dicom_processor.deidentify_dicom(ds, new_patient_id)
             orthanc.LogInfo(

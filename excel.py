@@ -175,24 +175,39 @@ class ExcelClient:
             )
 
         # Try primary key first
-        patient_id = self._excel_request(mapper_url(key))
-        if patient_id and patient_id != key:
-            with self._lock:
-                self.cache[cache_key][key] = patient_id
-                for ak in alt_keys:
-                    # Also seed alt keys with the same mapping
-                    self.cache[cache_key].setdefault(ak, patient_id)
-            return patient_id
+        if isinstance(key, list):
+            # Defensive: never allow a list as a key
+            for k in key:
+                patient_id = self._excel_request(mapper_url(k))
+                if patient_id and patient_id != k:
+                    with self._lock:
+                        self.cache[cache_key][k] = patient_id
+                    return patient_id
+        else:
+            patient_id = self._excel_request(mapper_url(key))
+            if patient_id and patient_id != key:
+                with self._lock:
+                    self.cache[cache_key][key] = patient_id
+                    for ak in alt_keys:
+                        self.cache[cache_key].setdefault(ak, patient_id)
+                return patient_id
 
-        # Try alternate keys
+        # Try alternate keys (always as individual strings)
         for ak in alt_keys:
-            patient_id = self._excel_request(mapper_url(ak))
-            if not patient_id or patient_id == ak:
-                continue
-            with self._lock:
-                self.cache[cache_key][key] = patient_id
-                self.cache[cache_key][ak] = patient_id
-            return patient_id
+            if isinstance(ak, list):
+                for k in ak:
+                    patient_id = self._excel_request(mapper_url(k))
+                    if patient_id and patient_id != k:
+                        with self._lock:
+                            self.cache[cache_key][k] = patient_id
+                        return patient_id
+            else:
+                patient_id = self._excel_request(mapper_url(ak))
+                if patient_id and patient_id != ak:
+                    with self._lock:
+                        self.cache[cache_key][key] = patient_id
+                        self.cache[cache_key][ak] = patient_id
+                    return patient_id
 
         orthanc.LogWarning(f"No mapping found in Excel for key: {key}")
         # Negative cache to prevent repeated lookups for the same missing key within this run

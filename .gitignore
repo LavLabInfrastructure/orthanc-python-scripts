@@ -3,3 +3,4 @@ venv
 orthanc.pyi
 .ipynb
 lavlab.yml
+.DS_Store

@@ -2,6 +2,7 @@
 
 import io
 import json
+import threading
 from typing import Union, List
 from concurrent.futures import ThreadPoolExecutor
 
@@ -35,6 +36,8 @@ class OrthancCallbackHandler:
         # Reusable, bounded worker pool to avoid spawning unbounded threads
         max_workers = int(orthanc_config.get("max_workers", 8) or 8)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        # Ensure only one /sync-all runs at a time
+        self._sync_all_lock = threading.Lock()
 
     def send_to_xnat(self, ds: pydicom.Dataset) -> None:
         """Send the DICOM dataset to XNAT using C-STORE."""
@@ -189,10 +192,30 @@ class OrthancCallbackHandler:
             return output.SendHttpStatusCode(500)
 
     def on_all_sync_call(self, output, uri, **request):
+        # If a sync-all is already in progress, reject with 409 Conflict
+        if not self._sync_all_lock.acquire(blocking=False):
+            orthanc.LogWarning(
+                "/sync-all is already running; rejecting concurrent request"
+            )
+            return output.SendHttpStatusCode(409)
         try:
             instances = json.loads(orthanc.RestApiGet("/instances"))
-            for inst in instances:
-                self.executor.submit(self.process_instance, inst)
+
+            def _worker(ids: List[str]):
+                try:
+                    for inst in ids:
+                        self.executor.submit(self.process_instance, inst)
+                finally:
+                    # Always release the lock when done scheduling
+                    self._sync_all_lock.release()
+
+            # Schedule in background so the REST call returns immediately
+            threading.Thread(target=_worker, args=(instances,), daemon=True).start()
             return output.SendHttpStatusCode(200)
         except Exception:  # pylint: disable=broad-except
+            # On error, ensure we release the lock
+            try:
+                self._sync_all_lock.release()
+            except Exception:
+                pass
             return output.SendHttpStatusCode(500)

@@ -4,6 +4,8 @@ import io
 import json
 import threading
 import time
+import warnings
+import re
 from typing import Union, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 
@@ -17,6 +19,21 @@ import orthanc  # type: ignore # pylint: disable=import-error
 from config import Config
 from processor import DicomProcessor
 from excel import ExcelClient
+
+# Reduce noisy warnings that cannot be prevented at read time
+warnings.filterwarnings(
+    "ignore", message=r".*unknown escape sequence.*", module="pydicom.charset"
+)
+# Also suppress common VR warnings during read; values will be sanitized afterward
+warnings.filterwarnings(
+    "ignore", message=r".*Invalid value for VR IS.*", category=UserWarning
+)
+warnings.filterwarnings(
+    "ignore", message=r".*value length.*allowed for VR IS.*", category=UserWarning
+)
+warnings.filterwarnings(
+    "ignore", message=r".*value length.*VR\.SH.*", category=UserWarning
+)
 
 
 # pylint: disable=unused-argument
@@ -276,6 +293,70 @@ class OrthancCallbackHandler:
                         f"Failed to resubmit pending instance {inst_id}: {exc}"
                     )
 
+    @staticmethod
+    def _sanitize_dataset(ds: pydicom.Dataset) -> pydicom.Dataset:
+        """Coerce common invalid VR values to valid forms to reduce warnings and improve interoperability."""
+        def _sanitize_is(val):
+            def _one(x):
+                # Convert floats/strings like '120000.000000' to '120000', strip non-digits
+                if isinstance(x, (int, float)):
+                    return str(int(x))
+                s = str(x)
+                m = re.search(r"[-+]?\d+", s)
+                if m:
+                    out = m.group(0)
+                else:
+                    out = "0"
+                return out[:12]
+            if isinstance(val, (list, tuple)):
+                return [_one(v) for v in val]
+            return _one(val)
+
+        def _limit_len(val, n, upper=False, allowed=None):
+            def _one(x):
+                s = str(x)
+                if upper:
+                    s = s.upper()
+                if allowed is not None:
+                    s = "".join(ch for ch in s if ch in allowed)
+                return s[:n]
+            if isinstance(val, (list, tuple)):
+                return [_one(v) for v in val]
+            return _one(val)
+
+        # Allowed chars for CS
+        cs_allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _")
+
+        try:
+            for elem in ds.iterall():
+                vr = getattr(elem, 'VR', None)
+                if not vr:
+                    continue
+                if vr == 'IS':
+                    try:
+                        elem.value = _sanitize_is(elem.value)
+                    except Exception:
+                        pass
+                elif vr == 'CS':
+                    try:
+                        elem.value = _limit_len(elem.value, 16, upper=True, allowed=cs_allowed)
+                    except Exception:
+                        pass
+                elif vr == 'SH':
+                    try:
+                        elem.value = _limit_len(elem.value, 16)
+                    except Exception:
+                        pass
+                elif vr == 'LO':
+                    try:
+                        elem.value = _limit_len(elem.value, 64)
+                    except Exception:
+                        pass
+        except Exception:
+            # Best effort sanitization; ignore if iterating fails
+            pass
+        return ds
+
     def process_instance(self, instance: Union[orthanc.DicomInstance, str]) -> None:
         """Process a new DICOM instance by re-identifying and sending it to XNAT."""
         try:
@@ -291,11 +372,17 @@ class OrthancCallbackHandler:
                 return
 
             try:
-                ds = pydicom.dcmread(io.BytesIO(dcm_bytes))
+                # Suppress noisy warnings emitted during parsing; we sanitize right after
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=UserWarning)
+                    ds = pydicom.dcmread(io.BytesIO(dcm_bytes))
                 ds.filename = None
             except pydicom.errors.InvalidDicomError:
                 orthanc.LogError(f"Invalid DICOM instance: {instance}")
                 return
+
+            # Sanitize common VR issues before further processing
+            ds = self._sanitize_dataset(ds)
 
             sheet = self.dicom_processor.match_dicom_to_sheet(ds)
             formatting = sheet.get("format", "{}")

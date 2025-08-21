@@ -60,7 +60,10 @@ class DicomProcessor:
         self._match_cache_max = 8192
 
     def deidentify_dicom(
-        self, ds: pydicom.Dataset, patient_id: str, sheet: Optional[dict[str, Any]] = None
+        self,
+        ds: pydicom.Dataset,
+        patient_id: str,
+        sheet: Optional[dict[str, Any]] = None,
     ) -> pydicom.Dataset:
         """De-identify the DICOM dataset and return the de-identified dataset.
         Optionally pass a pre-matched `sheet` to avoid recomputation inside helpers.
@@ -146,11 +149,7 @@ class DicomProcessor:
             if v is None:
                 fp_vals.append(None)
             else:
-                if not isinstance(v, str):
-                    try:
-                        v = v.value
-                    except Exception:  # pylint: disable=broad-except
-                        v = str(v)
+                # ds.get(tag) already returns the Python value; just coerce to string
                 fp_vals.append(str(v))
         fp = tuple(fp_vals)
         hit = self._match_cache.get(fp)
@@ -163,11 +162,6 @@ class DicomProcessor:
                 tag_val = ds.get(tag)
                 if tag_val is None:
                     continue
-                if not isinstance(tag_val, str):
-                    try:
-                        tag_val = tag_val.value
-                    except Exception:  # pylint: disable=broad-except
-                        tag_val = str(tag_val)
                 s = str(tag_val)
                 try:
                     if cre is not None:
@@ -194,25 +188,30 @@ class DicomProcessor:
         return default_sheet
 
     def deid_hash_uid_func(self, item, value, field, dicom) -> str:
-        """Performs self.hash to field.element.value"""
-        val = field.element.value
-        return DicomProcessor.hash_dicom_uid(str(val))
+        """Hash the provided value for UID fields."""
+        return DicomProcessor.hash_dicom_uid(str(value))
 
     def deid_hash_func(self, item, value, field, dicom) -> str:
-        """Performs self.hash to field.element.value"""
-        val = field.element.value
-        return DicomProcessor.hash(str(val))[:15]
+        """Hash the provided value and truncate for general string fields."""
+        return DicomProcessor.hash(str(value))[:15]
 
     def gather_diffusion_tags(self, item, value, field, dicom) -> pydicom.Dataset:
         """Gathers relevant diffusion info and formats into an MRDiffusionSequence."""
-        desc_val = dicom.get('SeriesDescription', '')
+        desc_val = dicom.get("SeriesDescription", "")
         desc = str(desc_val).lower()
         # Require either 'diffusion' OR 'dwi', and exclude ADC series
-        if ((('diffusion' not in desc) and ('dwi' not in desc)) or
-            'adc' in desc or 'apparent diffusion coefficient' in desc):
+        if (
+            (("diffusion" not in desc) and ("dwi" not in desc))
+            or "adc" in desc
+            or "apparent diffusion coefficient" in desc
+        ):
             return None
 
-        manufacturer = str(dicom.get('Manufacturer', '')).upper() if 'Manufacturer' in dicom else ''
+        manufacturer = (
+            str(dicom.get("Manufacturer", "")).upper()
+            if "Manufacturer" in dicom
+            else ""
+        )
         if not manufacturer:
             # Missing manufacturer; skip gracefully
             return None
@@ -226,15 +225,23 @@ class DicomProcessor:
         return handler(dicom)
 
     def deid_round_func(self, item, value, field, dicom) -> str:
-        """Performs self.hash to field.element.value"""
-        val = str(field.element.value).lower().strip("y")
-        return f"{self.round_to_nearest_five(int(val)):03}Y"
+        """Round age-like values to nearest 5 years, expressed as 'NNNY'."""
+        try:
+            val = str(value).lower().strip("y")
+            return f"{self.round_to_nearest_five(int(val)):03}Y"
+        except Exception:
+            # On unexpected formats, return a safe default
+            return "000Y"
 
     @staticmethod
     def remove_day(item, value, field, dicom) -> str:
-        """Removes the day from a DT field in the deid framework"""
-        dt = datetime.strptime(field.element.value, "%Y%m%d")
-        return dt.strftime("%Y%m01")
+        """Removes the day from a DT/DA field in the deid framework."""
+        try:
+            dt = datetime.strptime(str(value), "%Y%m%d")
+            return dt.strftime("%Y%m01")
+        except Exception:
+            # If parsing fails, return original value untouched
+            return str(value)
 
     @staticmethod
     def hash_dicom_uid(uid: str, namespace: str = "1.2.840.113619") -> str:
@@ -346,7 +353,7 @@ class DicomProcessor:
             if value is not None:
                 if value > 10000:
                     value = value % 100000  # god GE is so annoying
-                tags.add_new((0x0018, 0x9087), 'FD', float(value))
+                tags.add_new((0x0018, 0x9087), "FD", float(value))
 
         ## GE DTI SUCKS EVEN MORE! waiting until we need it before dealing with it
         return pydicom.Sequence([tags])

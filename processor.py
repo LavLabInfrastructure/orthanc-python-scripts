@@ -3,7 +3,7 @@
 import re
 import base64
 import hashlib
-from typing import Any
+from typing import Any, Optional
 from datetime import datetime
 
 import pydicom
@@ -31,9 +31,53 @@ class DicomProcessor:
             deid_config["recipe_paths"], deid_config["use_base_recipe"]
         )
         self.sheets = config.get_sheets()
+        # Precompile identifier regex for speed
+        for sheet in self.sheets:
+            compiled_list = []
+            for identifier in sheet.get("identifiers", []):
+                pattern = identifier.get("regex")
+                tag = identifier.get("tag")
+                if not tag or not pattern:
+                    continue
+                try:
+                    cre = re.compile(pattern)
+                except re.error:
+                    cre = None
+                identifier["_regex_compiled"] = cre
+                compiled_list.append((tag, cre, pattern))
+            sheet["_compiled_identifiers"] = compiled_list
+        # Build a stable ordered list of tags used across all sheets for fingerprinting
+        tag_order = []
+        seen_tags = set()
+        for sheet in self.sheets:
+            for tag, _, _ in sheet.get("_compiled_identifiers", []):
+                if tag not in seen_tags:
+                    seen_tags.add(tag)
+                    tag_order.append(tag)
+        self._match_tags: list[str] = tag_order
+        # Simple LRU-like cache for match results
+        self._match_cache: dict[tuple, dict[str, Any]] = {}
+        self._match_cache_max = 8192
 
-    def deidentify_dicom(self, ds: pydicom.Dataset, patient_id: str) -> pydicom.Dataset:
-        """De-identify the DICOM dataset and return the de-identified dataset."""
+    def deidentify_dicom(
+        self, ds: pydicom.Dataset, patient_id: str, sheet: Optional[dict[str, Any]] = None
+    ) -> pydicom.Dataset:
+        """De-identify the DICOM dataset and return the de-identified dataset.
+        Optionally pass a pre-matched `sheet` to avoid recomputation inside helpers.
+        """
+        if sheet is None:
+            # Best effort: compute and cache on dataset for helper functions
+            try:
+                sheet = self.match_dicom_to_sheet(ds)
+            except Exception:
+                sheet = None
+        # Cache selected sheet on the dataset for downstream helpers
+        try:
+            if sheet is not None:
+                setattr(ds, "_lavlab_sheet", sheet)
+        except Exception:
+            pass
+
         parser = DicomParser(ds, self.recipe)
 
         parser.define("excel_id", patient_id)
@@ -82,29 +126,72 @@ class DicomProcessor:
         )
 
     def get_project(self, ds: pydicom.Dataset):
-        """Use matching sheet to determine XNAT project"""
-        sheet = self.match_dicom_to_sheet(ds)
-        return sheet["xnat_project"]
+        """Use matching sheet to determine XNAT project, with per-dataset caching."""
+        try:
+            sheet = getattr(ds, "_lavlab_sheet", None)
+            if sheet is None:
+                sheet = self.match_dicom_to_sheet(ds)
+                setattr(ds, "_lavlab_sheet", sheet)
+            return sheet["xnat_project"]
+        except Exception:
+            sheet = self.match_dicom_to_sheet(ds)
+            return sheet["xnat_project"]
 
     def match_dicom_to_sheet(self, ds: pydicom.Dataset) -> dict[str, Any]:
-        """Find the sheet for the given DICOM dataset based on regex matching."""
+        """Find the sheet for the given DICOM dataset based on regex matching with caching."""
+        # Build fingerprint key from relevant tags
+        fp_vals = []
+        for tag in self._match_tags:
+            v = ds.get(tag)
+            if v is None:
+                fp_vals.append(None)
+            else:
+                if not isinstance(v, str):
+                    try:
+                        v = v.value
+                    except Exception:  # pylint: disable=broad-except
+                        v = str(v)
+                fp_vals.append(str(v))
+        fp = tuple(fp_vals)
+        hit = self._match_cache.get(fp)
+        if hit is not None:
+            return hit
+
+        # Fall back to regex scanning
         for sheet in self.sheets:
-            for identifier in sheet["identifiers"]:
-                tag = identifier["tag"]
-                regex = identifier["regex"]
+            for tag, cre, pattern in sheet.get("_compiled_identifiers", []):
                 tag_val = ds.get(tag)
                 if tag_val is None:
                     continue
                 if not isinstance(tag_val, str):
-                    # Handle DataElement and other value types
                     try:
                         tag_val = tag_val.value
                     except Exception:  # pylint: disable=broad-except
                         tag_val = str(tag_val)
-                if re.match(regex, str(tag_val)):
-                    return sheet
+                s = str(tag_val)
+                try:
+                    if cre is not None:
+                        if cre.match(s):
+                            # Cache and return
+                            if len(self._match_cache) >= self._match_cache_max:
+                                self._match_cache.clear()
+                            self._match_cache[fp] = sheet
+                            return sheet
+                    else:
+                        if re.match(pattern, s):
+                            if len(self._match_cache) >= self._match_cache_max:
+                                self._match_cache.clear()
+                            self._match_cache[fp] = sheet
+                            return sheet
+                except re.error:
+                    continue
         orthanc.LogError("No matching sheet found for the given DICOM dataset")
-        return self.sheets[0]  # Default to the first sheet
+        # Default
+        default_sheet = self.sheets[0]
+        if len(self._match_cache) >= self._match_cache_max:
+            self._match_cache.clear()
+        self._match_cache[fp] = default_sheet
+        return default_sheet
 
     def deid_hash_uid_func(self, item, value, field, dicom) -> str:
         """Performs self.hash to field.element.value"""
@@ -118,21 +205,14 @@ class DicomProcessor:
 
     def gather_diffusion_tags(self, item, value, field, dicom) -> pydicom.Dataset:
         """Gathers relevant diffusion info and formats into an MRDiffusionSequence."""
-        desc_val = dicom.get("SeriesDescription", "")
+        desc_val = dicom.get('SeriesDescription', '')
         desc = str(desc_val).lower()
         # Require either 'diffusion' OR 'dwi', and exclude ADC series
-        if (
-            (("diffusion" not in desc) and ("dwi" not in desc))
-            or "adc" in desc
-            or "apparent diffusion coefficient" in desc
-        ):
+        if ((('diffusion' not in desc) and ('dwi' not in desc)) or
+            'adc' in desc or 'apparent diffusion coefficient' in desc):
             return None
 
-        manufacturer = (
-            str(dicom.get("Manufacturer", "")).upper()
-            if "Manufacturer" in dicom
-            else ""
-        )
+        manufacturer = str(dicom.get('Manufacturer', '')).upper() if 'Manufacturer' in dicom else ''
         if not manufacturer:
             # Missing manufacturer; skip gracefully
             return None

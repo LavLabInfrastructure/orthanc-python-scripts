@@ -2,3 +2,4 @@ pyyaml
 requests
 pynetdicom
 deid
+pylibjpeg[all]

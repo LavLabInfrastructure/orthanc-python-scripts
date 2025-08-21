@@ -58,11 +58,19 @@ class OrthancCallbackHandler:
 
     @staticmethod
     def _ensure_uncompressed(ds: pydicom.Dataset) -> pydicom.Dataset:
-        """Transcode to Explicit VR Little Endian if dataset is compressed."""
+        """Transcode to Explicit VR Little Endian if dataset is compressed or not in an uncompressed TS."""
         try:
             ts = getattr(ds.file_meta, "TransferSyntaxUID", None)
-            if ts and not ts.is_uncompressed:
-                # Decompress pixel data in place (requires pylibjpeg[all])
+            if not ts:
+                return ds
+            # Treat as uncompressed only for the known uncompressed transfer syntaxes
+            uncompressed = {
+                str(ExplicitVRLittleEndian),
+                str(ImplicitVRLittleEndian),
+                "1.2.840.10008.1.2.2",  # Explicit VR Big Endian (retired but uncompressed)
+            }
+            if str(ts) not in uncompressed:
+                # Decompress pixel data in place (requires pylibjpeg[all] for JPEG/J2K)
                 ds.decompress()
                 ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
         except Exception as exc:  # pylint: disable=broad-except

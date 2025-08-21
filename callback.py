@@ -3,12 +3,14 @@
 import io
 import json
 import threading
+import time
 from typing import Union, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 import pydicom
 import pydicom.errors
-from pynetdicom import AE, StoragePresentationContexts
+from pydicom.uid import ExplicitVRLittleEndian, ImplicitVRLittleEndian
+from pynetdicom import AE, StoragePresentationContexts, build_context
 from pynetdicom.association import Association
 
 import orthanc  # type: ignore # pylint: disable=import-error
@@ -36,32 +38,112 @@ class OrthancCallbackHandler:
         # Reusable, bounded worker pool to avoid spawning unbounded threads
         max_workers = int(orthanc_config.get("max_workers", 8) or 8)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        # Bound the number of queued tasks to protect memory over multi-day runs
+        max_queue = int(orthanc_config.get("max_queue", 1000) or 1000)
+        self._submit_sema = threading.Semaphore(max_queue)
         # Ensure only one /sync-all runs at a time
         self._sync_all_lock = threading.Lock()
         # Pending queue: map of ID -> set(instance_id) awaiting discovered mapping
         self._pending_lock = threading.RLock()
         self._pending_by_id: dict[str, set[str]] = {}
+        # Cap to protect memory over multi-day runs
+        self._pending_max_ids = int(
+            orthanc_config.get("pending_max_ids", 10000) or 10000
+        )
+        # Per-instance retry cap when re-queuing due to missing mapping
+        self._pending_retries: dict[str, int] = {}
+        self._pending_retries_max = int(
+            orthanc_config.get("pending_max_retries", 5) or 5
+        )
 
-    def send_to_xnat(self, ds: pydicom.Dataset) -> None:
-        """Send the DICOM dataset to XNAT using C-STORE."""
+    @staticmethod
+    def _ensure_uncompressed(ds: pydicom.Dataset) -> pydicom.Dataset:
+        """Transcode to Explicit VR Little Endian if dataset is compressed."""
         try:
-            ae = AE(ae_title=self.ae_title)
-            ae.requested_contexts = StoragePresentationContexts
-            assoc: Association = ae.associate(
-                self.xnat_ip, self.xnat_port, ae_title=self.xnat_ae_title
-            )
-
-            if assoc.is_established:
-                status = assoc.send_c_store(ds)
-                assoc.release()
-                if status:
-                    orthanc.LogInfo("Successfully sent DICOM file to XNAT")
-                else:
-                    orthanc.LogError("Failed to send DICOM file to XNAT")
-            else:
-                orthanc.LogError("Failed to associate with XNAT")
+            ts = getattr(ds.file_meta, "TransferSyntaxUID", None)
+            if ts and not ts.is_uncompressed:
+                # Decompress pixel data in place (requires pylibjpeg[all])
+                ds.decompress()
+                ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
         except Exception as exc:  # pylint: disable=broad-except
-            orthanc.LogError(f"Exception during C-STORE: {exc}")
+            orthanc.LogWarning(f"Failed to decompress DICOM: {exc}")
+        return ds
+
+    def _build_uncompressed_contexts(self):
+        """Requested contexts restricted to uncompressed syntaxes for compatibility."""
+        syntaxes = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
+        try:
+            return [
+                build_context(cx.abstract_syntax, syntaxes)
+                for cx in StoragePresentationContexts
+            ]
+        except Exception:
+            return StoragePresentationContexts
+
+    def _requested_contexts_for_dataset(self, ds: pydicom.Dataset):
+        """Prefer a single context matching the dataset SOP Class with uncompressed syntaxes."""
+        syntaxes = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
+        try:
+            sop = getattr(ds, "SOPClassUID", None)
+            if sop:
+                return [build_context(sop, syntaxes)]
+        except Exception:
+            pass
+        return self._build_uncompressed_contexts()
+
+    def send_to_xnat(self, ds: pydicom.Dataset) -> bool:
+        """Send the DICOM dataset to XNAT using C-STORE with retries and safe transfer syntax.
+        Returns True on success, False otherwise."""
+        # Ensure uncompressed syntax for broader compatibility
+        ds = self._ensure_uncompressed(ds)
+
+        attempts = 0
+        max_attempts = 3
+        backoff = 1.0
+        while attempts < max_attempts:
+            attempts += 1
+            ae = None
+            try:
+                ae = AE(ae_title=self.ae_title)
+                # Restrict to uncompressed explicit little endian
+                ae.requested_contexts = self._requested_contexts_for_dataset(ds)
+                # Reasonable timeouts for long runs
+                ae.acse_timeout = 30
+                ae.dimse_timeout = 60
+                ae.network_timeout = 30
+
+                assoc: Association = ae.associate(
+                    self.xnat_ip, self.xnat_port, ae_title=self.xnat_ae_title
+                )
+
+                if assoc.is_established:
+                    status = assoc.send_c_store(ds)
+                    assoc.release()
+                    # status is a pydicom Dataset; success is 0x0000
+                    try:
+                        code = getattr(status, "Status", None)
+                    except Exception:
+                        code = None
+                    if code == 0x0000:
+                        orthanc.LogInfo("Successfully sent DICOM file to XNAT")
+                        return True
+                    else:
+                        orthanc.LogError(f"C-STORE failed with status: {code}")
+                else:
+                    orthanc.LogError("Failed to associate with XNAT")
+            except Exception as exc:  # pylint: disable=broad-except
+                orthanc.LogError(f"Exception during C-STORE: {exc}")
+            finally:
+                try:
+                    if ae is not None:
+                        ae.shutdown()
+                except Exception:
+                    pass
+
+            # Retry with backoff
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 10)
+        return False
 
     @staticmethod
     def _extract_patient_ids(ds: pydicom.Dataset) -> List[str]:
@@ -117,12 +199,25 @@ class OrthancCallbackHandler:
     ) -> None:
         """Queue this instance to be retried later when a mapping is discovered for any of the given ids."""
         if not instance_id:
-            # If we don't have a stable string id, we cannot re-fetch later
             orthanc.LogWarning(
                 "Instance has no string ID; cannot queue for retry without mapping"
             )
             return
         with self._pending_lock:
+            # Per-instance retry cap
+            count = self._pending_retries.get(instance_id, 0)
+            if count >= self._pending_retries_max:
+                orthanc.LogWarning(
+                    f"Max pending retries reached for {instance_id}; dropping from queue"
+                )
+                return
+            self._pending_retries[instance_id] = count + 1
+
+            if len(self._pending_by_id) >= self._pending_max_ids:
+                orthanc.LogWarning(
+                    "Pending mapping queue is full; dropping new pending item"
+                )
+                return
             for pid in ids:
                 try:
                     pid = str(pid)
@@ -136,6 +231,21 @@ class OrthancCallbackHandler:
         orthanc.LogInfo(
             f"Queued instance {instance_id} for retry; awaiting mapping for IDs: {ids}"
         )
+
+    def _submit_instance(self, instance_id: str) -> None:
+        """Submit an instance to the executor with queue bounding."""
+        self._submit_sema.acquire()
+
+        def _run():
+            try:
+                self.process_instance(instance_id)
+            finally:
+                try:
+                    self._submit_sema.release()
+                except Exception:
+                    pass
+
+        self.executor.submit(_run)
 
     def _flush_pending_for_ids(self, ids: List[str]) -> None:
         """Re-schedule any pending instances that share any of these ids now that a mapping is known."""
@@ -152,7 +262,7 @@ class OrthancCallbackHandler:
             )
             for inst_id in to_retry:
                 try:
-                    self.executor.submit(self.process_instance, inst_id)
+                    self._submit_instance(inst_id)
                 except Exception as exc:  # pylint: disable=broad-except
                     orthanc.LogError(
                         f"Failed to resubmit pending instance {inst_id}: {exc}"
@@ -216,7 +326,11 @@ class OrthancCallbackHandler:
             orthanc.LogInfo(
                 f"Re-identified DICOM with new patient ID: {new_patient_id}"
             )
-            self.send_to_xnat(deidentified_ds)
+            ok = self.send_to_xnat(deidentified_ds)
+            if ok and instance_id_str:
+                # Clear retry counter on success
+                with self._pending_lock:
+                    self._pending_retries.pop(instance_id_str, None)
         except Exception as exc:  # pylint: disable=broad-except
             orthanc.LogError(
                 f"Unhandled exception while processing instance {instance}: {exc}"
@@ -226,7 +340,7 @@ class OrthancCallbackHandler:
         """Callback function triggered when a new instance is stored in Orthanc."""
         try:
             orthanc.LogInfo(f"Queueing new instance: {instance_id}")
-            self.executor.submit(self.process_instance, instance_id)
+            self._submit_instance(instance_id)
         except Exception as exc:  # pylint: disable=broad-except
             orthanc.LogError(f"Failed to queue instance {instance_id}: {exc}")
 
@@ -247,7 +361,7 @@ class OrthancCallbackHandler:
 
             instances = series_response.get("instances", [])
             for inst in instances:
-                self.executor.submit(self.process_instance, inst)
+                self._submit_instance(inst)
             return output.SendHttpStatusCode(200)
         except Exception:  # pylint: disable=broad-except
             return output.SendHttpStatusCode(500)
@@ -265,7 +379,7 @@ class OrthancCallbackHandler:
             def _worker(ids: List[str]):
                 try:
                     for inst in ids:
-                        self.executor.submit(self.process_instance, inst)
+                        self._submit_instance(inst)
                 finally:
                     # Always release the lock when done scheduling
                     self._sync_all_lock.release()

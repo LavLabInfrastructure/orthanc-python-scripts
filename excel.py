@@ -2,7 +2,7 @@
 
 from time import time
 from typing import Any, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 
 import threading
 import requests
@@ -50,12 +50,16 @@ class ExcelClient:
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=frozenset(["GET", "POST"]),
             raise_on_status=False,
+            respect_retry_after_header=True,
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
         self._lock = threading.RLock()
+        # Limit concurrent Graph calls to mitigate throttling (429) on long runs
+        max_concurrent = int(microsoft_config.get("max_concurrent_requests", 4) or 4)
+        self._graph_sema = threading.Semaphore(max_concurrent)
 
     def get_access_token(self) -> str:
         """Get an access token from the Microsoft Graph API, refreshing if needed."""
@@ -93,6 +97,7 @@ class ExcelClient:
         token = self.get_access_token()
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         try:
+            self._graph_sema.acquire()
             resp = self.session.get(url, headers=headers, timeout=30)
             if resp.status_code == 401:
                 # Refresh token and retry once
@@ -116,6 +121,11 @@ class ExcelClient:
         except Exception as exc:  # pylint: disable=broad-except
             orthanc.LogWarning(f"HTTP error while contacting Excel API: {exc}")
             return None
+        finally:
+            try:
+                self._graph_sema.release()
+            except Exception:
+                pass
 
     def _excel_request(self, url: str) -> Optional[str]:
         """Make a request to the Microsoft Graph API for Excel and extract the first scalar cell as text."""
@@ -169,9 +179,11 @@ class ExcelClient:
 
         def mapper_url(name: str) -> str:
             # Name-based addressing: prefix with '_' as in the original implementation
+            # Escape the name to ensure a valid URL path segment
+            safe_name = quote(str(name), safe="")
             return urljoin(
                 self.graph_root_url,
-                f"/v1.0/drives/{drive_id}/items/{file_id}/workbook/worksheets/{worksheet_id}/range(address='_{name}')",
+                f"/v1.0/drives/{drive_id}/items/{file_id}/workbook/worksheets/{worksheet_id}/range(address='_{safe_name}')",
             )
 
         # Try primary key first

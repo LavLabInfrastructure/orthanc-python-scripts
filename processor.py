@@ -96,6 +96,35 @@ class DicomProcessor:
         parser.remove_private()
         return parser.dicom
 
+    def _coerce_for_vr(self, field, val: Any) -> str:
+        """Coerce returned values to match the VR constraints of the target element.
+        - SH: max 16 chars
+        - LO: max 64 chars
+        - CS: uppercased, allowed charset, max 16
+        Falls back to str(val) if VR unavailable.
+        """
+        try:
+            vr = getattr(getattr(field, "element", None), "VR", None)
+        except Exception:
+            vr = None
+        s = str(val)
+        if vr == "CS":
+            allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _")
+            s = "".join(ch for ch in s.upper() if ch in allowed)[:16]
+        elif vr == "SH":
+            s = s[:16]
+        elif vr == "LO":
+            s = s[:64]
+        return s
+
+    def deid_hash_uid_func(self, item, value, field, dicom) -> str:
+        """Hash the provided value for UID fields."""
+        return self._coerce_for_vr(field, DicomProcessor.hash_dicom_uid(str(value)))
+
+    def deid_hash_func(self, item, value, field, dicom) -> str:
+        """Hash the provided value and truncate for general string fields."""
+        return self._coerce_for_vr(field, DicomProcessor.hash(str(value))[:15])
+
     def format_xnat_route_antiphi(self, item, value, field, dicom):
         """
         Formats the XNAT route and assigns to the given field.
@@ -114,9 +143,10 @@ class DicomProcessor:
             f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
         )
 
-        return (
+        result = (
             f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
         )
+        return self._coerce_for_vr(field, result)
 
     def format_xnat_route(self, item, value, field, dicom):
         """Formats the XNAT route and assigns to the given field."""
@@ -124,9 +154,10 @@ class DicomProcessor:
         sesh = (
             f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
         )
-        return (
+        result = (
             f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
         )
+        return self._coerce_for_vr(field, result)
 
     def get_project(self, ds: pydicom.Dataset):
         """Use matching sheet to determine XNAT project, with per-dataset caching."""
@@ -187,14 +218,6 @@ class DicomProcessor:
         self._match_cache[fp] = default_sheet
         return default_sheet
 
-    def deid_hash_uid_func(self, item, value, field, dicom) -> str:
-        """Hash the provided value for UID fields."""
-        return DicomProcessor.hash_dicom_uid(str(value))
-
-    def deid_hash_func(self, item, value, field, dicom) -> str:
-        """Hash the provided value and truncate for general string fields."""
-        return DicomProcessor.hash(str(value))[:15]
-
     def gather_diffusion_tags(self, item, value, field, dicom) -> pydicom.Dataset:
         """Gathers relevant diffusion info and formats into an MRDiffusionSequence."""
         desc_val = dicom.get("SeriesDescription", "")
@@ -228,20 +251,22 @@ class DicomProcessor:
         """Round age-like values to nearest 5 years, expressed as 'NNNY'."""
         try:
             val = str(value).lower().strip("y")
-            return f"{self.round_to_nearest_five(int(val)):03}Y"
+            out = f"{self.round_to_nearest_five(int(val)):03}Y"
+            return self._coerce_for_vr(field, out)
         except Exception:
-            # On unexpected formats, return a safe default
-            return "000Y"
+            return self._coerce_for_vr(field, "000Y")
 
     @staticmethod
     def remove_day(item, value, field, dicom) -> str:
         """Removes the day from a DT/DA field in the deid framework."""
         try:
             dt = datetime.strptime(str(value), "%Y%m%d")
-            return dt.strftime("%Y%m01")
+            out = dt.strftime("%Y%m01")
         except Exception:
-            # If parsing fails, return original value untouched
-            return str(value)
+            out = str(value)
+        # Cannot access self here (static), so SH/LO/CS cannot be enforced via helper.
+        # Rely on post-deid sanitization in callback.
+        return out
 
     @staticmethod
     def hash_dicom_uid(uid: str, namespace: str = "1.2.840.113619") -> str:

@@ -33,9 +33,6 @@ warnings.filterwarnings(
 warnings.filterwarnings(
     "ignore", message=r".*value length.*allowed for VR IS.*", category=UserWarning
 )
-warnings.filterwarnings(
-    "ignore", message=r".*value length.*VR\.SH.*", category=UserWarning
-)
 
 
 # pylint: disable=unused-argument
@@ -433,6 +430,8 @@ class OrthancCallbackHandler:
             self._flush_pending_for_ids(all_ids)
 
             deidentified_ds = self.dicom_processor.deidentify_dicom(ds, new_patient_id)
+            # Sanitize again post-deid to enforce VR limits (e.g., SH<=16, LO<=64)
+            deidentified_ds = self._sanitize_dataset(deidentified_ds)
             orthanc.LogInfo(
                 f"Re-identified DICOM with new patient ID: {new_patient_id}"
             )

@@ -324,15 +324,29 @@ class DicomProcessor:
         return pydicom.Sequence([tags])
 
     @staticmethod
-    def handle_ge(ds: pydicom.Dataset) -> None:
+    def handle_ge(ds: pydicom.Dataset) -> pydicom.Sequence:
         """Handles GE specific diffusion tags."""
         tags = pydicom.Dataset()
-        # bval
+        # bval: GE often encodes as a MultiValue, but may also be a single IS
         if (0x0043, 0x1039) in ds:
-            value = int(ds[(0x0043, 0x1039)].value[0])
-            if value > 10000:
-                value = value % 100000  # god GE is so annoying
-            tags.add_new((0x0018, 0x9087), "FD", value)
+            raw = ds[(0x0043, 0x1039)].value
+            try:
+                first = raw[0] if isinstance(raw, (list, tuple)) else raw
+            except Exception:
+                first = raw
+            # Coerce to int safely
+            value: int | None
+            try:
+                value = int(first)
+            except Exception:
+                try:
+                    value = int(float(str(first)))
+                except Exception:
+                    value = None
+            if value is not None:
+                if value > 10000:
+                    value = value % 100000  # god GE is so annoying
+                tags.add_new((0x0018, 0x9087), 'FD', float(value))
 
         ## GE DTI SUCKS EVEN MORE! waiting until we need it before dealing with it
         return pydicom.Sequence([tags])

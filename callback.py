@@ -6,8 +6,10 @@ import threading
 import time
 import warnings
 import re
+import ast
 from typing import Union, List, Optional
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Sequence
 
 import pydicom
 import pydicom.errors
@@ -174,39 +176,47 @@ class OrthancCallbackHandler:
     def _extract_patient_ids(ds: pydicom.Dataset) -> List[str]:
         """Extract possible alternate patient identifiers from standard fields.
         Returns a list of candidate IDs (may be empty)."""
+
+        def _to_list(v) -> List[str]:
+            if v is None:
+                return []
+            # Treat any non-string sequence (e.g., pydicom MultiValue) as a list of values
+            try:
+                from collections.abc import Sequence as _Seq
+
+                if isinstance(v, _Seq) and not isinstance(v, (str, bytes)):
+                    return [str(x) for x in v if x is not None and str(x) != ""]
+            except Exception:
+                pass
+            s = str(v).strip()
+            # Try to parse Python-like list strings: "['A','B']"
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    lit = ast.literal_eval(s)
+                    if isinstance(lit, (list, tuple)):
+                        return [str(x) for x in lit if x is not None and str(x) != ""]
+                except Exception:
+                    pass
+            # Split by DICOM multi-valued delimiter (backslash)
+            if "\\" in s:
+                return [p.strip() for p in s.split("\\") if p.strip()]
+            # As a last resort, split by comma if present
+            if "," in s:
+                return [p.strip().strip("'\"") for p in s.split(",") if p.strip()]
+            return [s] if s else []
+
         candidates: List[str] = []
-        # Primary ID
-        primary = ds.get("PatientID")
-        if primary:
-            try:
-                candidates.append(str(primary))
-            except Exception:  # pylint: disable=broad-except
-                pass
-
-        # OtherPatientIDs might be backslash-separated string or a sequence-like
-        other_ids = ds.get("OtherPatientIDs")
-        if other_ids:
-            try:
-                # If iterable (list/tuple), extend; else split string by '\\'
-                if isinstance(other_ids, (list, tuple)):
-                    candidates.extend(str(v) for v in other_ids if v)
-                else:
-                    for v in str(other_ids).split("\\"):
-                        v = v.strip()
-                        if v:
-                            candidates.append(v)
-            except Exception:  # pylint: disable=broad-except
-                pass
-
-        # OtherPatientIDsSequence
+        # Primary ID(s)
+        candidates.extend(_to_list(ds.get("PatientID")))
+        # OtherPatientIDs may be multi-valued
+        candidates.extend(_to_list(ds.get("OtherPatientIDs")))
+        # OtherPatientIDsSequence items may contain IDs
         seq = ds.get("OtherPatientIDsSequence")
         if seq:
             try:
                 for item in seq:
-                    for k in ("PatientID", "ID"):
-                        val = item.get(k)
-                        if val:
-                            candidates.append(str(val))
+                    candidates.extend(_to_list(item.get("PatientID")))
+                    candidates.extend(_to_list(item.get("ID")))
             except Exception:  # pylint: disable=broad-except
                 pass
 
@@ -296,6 +306,7 @@ class OrthancCallbackHandler:
     @staticmethod
     def _sanitize_dataset(ds: pydicom.Dataset) -> pydicom.Dataset:
         """Coerce common invalid VR values to valid forms to reduce warnings and improve interoperability."""
+
         def _sanitize_is(val):
             def _one(x):
                 # Convert floats/strings like '120000.000000' to '120000', strip non-digits
@@ -308,6 +319,7 @@ class OrthancCallbackHandler:
                 else:
                     out = "0"
                 return out[:12]
+
             if isinstance(val, (list, tuple)):
                 return [_one(v) for v in val]
             return _one(val)
@@ -320,6 +332,7 @@ class OrthancCallbackHandler:
                 if allowed is not None:
                     s = "".join(ch for ch in s if ch in allowed)
                 return s[:n]
+
             if isinstance(val, (list, tuple)):
                 return [_one(v) for v in val]
             return _one(val)
@@ -329,25 +342,27 @@ class OrthancCallbackHandler:
 
         try:
             for elem in ds.iterall():
-                vr = getattr(elem, 'VR', None)
+                vr = getattr(elem, "VR", None)
                 if not vr:
                     continue
-                if vr == 'IS':
+                if vr == "IS":
                     try:
                         elem.value = _sanitize_is(elem.value)
                     except Exception:
                         pass
-                elif vr == 'CS':
+                elif vr == "CS":
                     try:
-                        elem.value = _limit_len(elem.value, 16, upper=True, allowed=cs_allowed)
+                        elem.value = _limit_len(
+                            elem.value, 16, upper=True, allowed=cs_allowed
+                        )
                     except Exception:
                         pass
-                elif vr == 'SH':
+                elif vr == "SH":
                     try:
                         elem.value = _limit_len(elem.value, 16)
                     except Exception:
                         pass
-                elif vr == 'LO':
+                elif vr == "LO":
                     try:
                         elem.value = _limit_len(elem.value, 64)
                     except Exception:

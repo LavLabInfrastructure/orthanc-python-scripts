@@ -118,21 +118,29 @@ class DicomProcessor:
 
     def gather_diffusion_tags(self, item, value, field, dicom) -> pydicom.Dataset:
         """Gathers relevant diffusion info and formats into an MRDiffusionSequence."""
-        desc = str(dicom.SeriesDescription).lower()
+        desc_val = dicom.get("SeriesDescription", "")
+        desc = str(desc_val).lower()
+        # Require either 'diffusion' OR 'dwi', and exclude ADC series
         if (
-            "diffusion" not in desc
-            or "dwi" not in desc
+            (("diffusion" not in desc) and ("dwi" not in desc))
             or "adc" in desc
             or "apparent diffusion coefficient" in desc
         ):
             return None
-        manufacturer = dicom.Manufacturer.upper() if "Manufacturer" in dicom else None
+
+        manufacturer = (
+            str(dicom.get("Manufacturer", "")).upper()
+            if "Manufacturer" in dicom
+            else ""
+        )
         if not manufacturer:
-            raise ValueError("Manufacturer information is missing from the DICOM file")
+            # Missing manufacturer; skip gracefully
+            return None
 
         handler = self.MANUFACTURER_HANDLERS.get(manufacturer)
         if not handler:
-            raise ValueError(f"Unsupported or unknown manufacturer: {manufacturer}")
+            # Unsupported manufacturer; skip gracefully
+            return None
 
         # Call the handler function to get DiffusionSequence
         return handler(dicom)

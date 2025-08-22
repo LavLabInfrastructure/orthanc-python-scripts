@@ -71,6 +71,128 @@ class OrthancCallbackHandler:
         self._pending_retries_max = int(
             orthanc_config.get("pending_max_retries", 5) or 5
         )
+        # Memoize uncompressed presentation contexts and configure association pool
+        self._contexts_all_uncompressed = self._build_uncompressed_contexts()
+        self._max_pdu_size = int(orthanc_config.get("max_pdu_size", 262144) or 262144)
+        self._assoc_pool_size = int(orthanc_config.get("assoc_pool_size", 4) or 4)
+        self._acse_timeout = int(orthanc_config.get("acse_timeout", 30) or 30)
+        self._dimse_timeout = int(orthanc_config.get("dimse_timeout", 60) or 60)
+        self._network_timeout = int(orthanc_config.get("network_timeout", 30) or 30)
+        self._assoc_pool = self._AssociationPool(
+            self.xnat_ip,
+            self.xnat_port,
+            self.ae_title,
+            self.xnat_ae_title,
+            self._contexts_all_uncompressed,
+            self._assoc_pool_size,
+            self._max_pdu_size,
+            self._acse_timeout,
+            self._dimse_timeout,
+            self._network_timeout,
+        )
+
+    class _AssociationPool:
+        """Thread-safe pool of persistent pynetdicom associations."""
+        def __init__(
+            self,
+            ip: str,
+            port: int,
+            local_ae_title: str,
+            peer_ae_title: str,
+            requested_contexts,
+            pool_size: int,
+            max_pdu_size: int,
+            acse_timeout: int,
+            dimse_timeout: int,
+            network_timeout: int,
+        ):
+            self._ip = ip
+            self._port = port
+            self._local = local_ae_title
+            self._peer = peer_ae_title
+            self._contexts = requested_contexts
+            self._pool_size = max(1, pool_size)
+            self._max_pdu = max_pdu_size
+            self._acse = acse_timeout
+            self._dimse = dimse_timeout
+            self._net = network_timeout
+            self._lock = threading.Lock()
+            self._available: list[Association] = []
+            self._total = 0
+
+        def _create(self) -> Optional[Association]:
+            try:
+                ae = AE(ae_title=self._local)
+                ae.requested_contexts = self._contexts
+                ae.maximum_pdu_size = self._max_pdu
+                ae.acse_timeout = self._acse
+                ae.dimse_timeout = self._dimse
+                ae.network_timeout = self._net
+                assoc: Association = ae.associate(self._ip, self._port, ae_title=self._peer)
+                if assoc.is_established:
+                    # attach AE so we can shutdown when discarding
+                    setattr(assoc, "_lavlab_ae", ae)
+                    return assoc
+                else:
+                    try:
+                        ae.shutdown()
+                    except Exception:
+                        pass
+                    return None
+            except Exception as exc:
+                orthanc.LogError(f"Failed to create association: {exc}")
+                return None
+
+        def acquire(self, timeout: float = 5.0) -> Optional[Association]:
+            """Get an established association or create one if capacity allows."""
+            end = time.time() + timeout
+            while True:
+                with self._lock:
+                    if self._available:
+                        assoc = self._available.pop()
+                        if assoc.is_established:
+                            return assoc
+                        else:
+                            self._discard_internal(assoc)
+                    elif self._total < self._pool_size:
+                        assoc = self._create()
+                        if assoc is not None:
+                            self._total += 1
+                            return assoc
+                        # creation failed, loop and retry until timeout
+                # outside lock
+                if time.time() >= end:
+                    return None
+                time.sleep(0.05)
+
+        def release(self, assoc: Association) -> None:
+            with self._lock:
+                if assoc and assoc.is_established:
+                    self._available.append(assoc)
+                else:
+                    self._discard_internal(assoc)
+
+        def discard(self, assoc: Association) -> None:
+            with self._lock:
+                self._discard_internal(assoc)
+
+        def _discard_internal(self, assoc: Optional[Association]) -> None:
+            try:
+                if assoc is not None:
+                    try:
+                        assoc.abort()
+                    except Exception:
+                        pass
+                    try:
+                        ae = getattr(assoc, "_lavlab_ae", None)
+                        if ae is not None:
+                            ae.shutdown()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                self._total = max(0, self._total - 1)
 
     @staticmethod
     def _ensure_uncompressed(ds: pydicom.Dataset) -> pydicom.Dataset:
@@ -116,7 +238,7 @@ class OrthancCallbackHandler:
         return self._build_uncompressed_contexts()
 
     def send_to_xnat(self, ds: pydicom.Dataset) -> bool:
-        """Send the DICOM dataset to XNAT using C-STORE with retries and safe transfer syntax.
+        """Send the DICOM dataset to XNAT using C-STORE with retries and association reuse.
         Returns True on success, False otherwise."""
         # Ensure uncompressed syntax for broader compatibility
         ds = self._ensure_uncompressed(ds)
@@ -126,44 +248,26 @@ class OrthancCallbackHandler:
         backoff = 1.0
         while attempts < max_attempts:
             attempts += 1
-            ae = None
+            assoc = self._assoc_pool.acquire(timeout=5.0)
+            if assoc is None:
+                orthanc.LogError("No association available to send C-STORE")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 10)
+                continue
             try:
-                ae = AE(ae_title=self.ae_title)
-                # Restrict to uncompressed explicit little endian
-                ae.requested_contexts = self._requested_contexts_for_dataset(ds)
-                # Reasonable timeouts for long runs
-                ae.acse_timeout = 30
-                ae.dimse_timeout = 60
-                ae.network_timeout = 30
-
-                assoc: Association = ae.associate(
-                    self.xnat_ip, self.xnat_port, ae_title=self.xnat_ae_title
-                )
-
-                if assoc.is_established:
-                    status = assoc.send_c_store(ds)
-                    assoc.release()
-                    # status is a pydicom Dataset; success is 0x0000
-                    try:
-                        code = getattr(status, "Status", None)
-                    except Exception:
-                        code = None
-                    if code == 0x0000:
-                        orthanc.LogInfo("Successfully sent DICOM file to XNAT")
-                        return True
-                    else:
-                        orthanc.LogError(f"C-STORE failed with status: {code}")
+                status = assoc.send_c_store(ds)
+                # status is a pydicom Dataset; success is 0x0000
+                code = getattr(status, "Status", None)
+                if code == 0x0000:
+                    self._assoc_pool.release(assoc)
+                    orthanc.LogInfo("Successfully sent DICOM file to XNAT")
+                    return True
                 else:
-                    orthanc.LogError("Failed to associate with XNAT")
+                    orthanc.LogError(f"C-STORE failed with status: {code}")
+                    self._assoc_pool.discard(assoc)
             except Exception as exc:  # pylint: disable=broad-except
                 orthanc.LogError(f"Exception during C-STORE: {exc}")
-            finally:
-                try:
-                    if ae is not None:
-                        ae.shutdown()
-                except Exception:
-                    pass
-
+                self._assoc_pool.discard(assoc)
             # Retry with backoff
             time.sleep(backoff)
             backoff = min(backoff * 2, 10)
@@ -318,8 +422,8 @@ class OrthancCallbackHandler:
                 return out[:12]
 
             if isinstance(val, (list, tuple)):
-                return [_one(v) for v in val]
-            return _one(val)
+                return [_sanitize_is(v) for v in val]
+            return _sanitize_is(val)
 
         def _limit_len(val, n, upper=False, allowed=None):
             def _one(x):

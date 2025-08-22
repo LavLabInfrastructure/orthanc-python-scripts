@@ -8,7 +8,7 @@ import warnings
 import re
 import ast
 from typing import Union, List, Optional, Any
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from collections.abc import Sequence
 
 import pydicom
@@ -52,13 +52,33 @@ class OrthancCallbackHandler:
         self.excel_client = excel_client
 
         # Reusable, bounded worker pools
-        max_workers = int(orthanc_config.get("max_workers", 8) or 8)
-        cpu_workers = int(orthanc_config.get("cpu_max_workers", max_workers) or max_workers)
-        io_workers = int(orthanc_config.get("io_max_workers", max_workers * 2) or (max_workers * 2))
+        max_workers = int(orthanc_config.get("max_workers", 4) or 4)
+        cpu_workers = int(
+            orthanc_config.get("cpu_max_workers", max_workers) or max_workers
+        )
+        io_workers = int(
+            orthanc_config.get("io_max_workers", max_workers * 2) or (max_workers * 2)
+        )
         self.executor = ThreadPoolExecutor(max_workers=cpu_workers)
         self._io_executor = ThreadPoolExecutor(max_workers=io_workers)
+        # Process pool for CPU-bound de-identification
+        proc_workers = int(
+            orthanc_config.get("process_pool_workers", cpu_workers) or cpu_workers
+        )
+        try:
+            # Initialize worker with the configuration dict so each worker creates its own DicomProcessor
+            self._process_pool = ProcessPoolExecutor(
+                max_workers=proc_workers,
+                initializer=processor_module.worker_init,
+                initargs=(config.config,),
+            )
+        except Exception:
+            # If process pool creation fails, fall back to single-process execution
+            self._process_pool = None
         # Dedicated send executor (I/O bound)
-        send_workers = int(orthanc_config.get("send_max_workers", max_workers) or max_workers)
+        send_workers = int(
+            orthanc_config.get("send_max_workers", max_workers) or max_workers
+        )
         self.send_executor = ThreadPoolExecutor(max_workers=send_workers)
         # Bound the number of queued tasks to protect memory over multi-day runs
         max_queue = int(orthanc_config.get("max_queue", 1000) or 1000)
@@ -80,7 +100,9 @@ class OrthancCallbackHandler:
             orthanc_config.get("pending_max_retries", 5) or 5
         )
         # Prefer keeping images compressed end-to-end; include compressed syntaxes in contexts
-        self._prefer_compressed = str(orthanc_config.get("prefer_compressed", "true")).lower() not in ("false", "0", "no")
+        self._prefer_compressed = str(
+            orthanc_config.get("prefer_compressed", "true")
+        ).lower() not in ("false", "0", "no")
         # Memoize preferred contexts (compressed + uncompressed) and configure association pool
         self._contexts_all_preferred = self._build_preferred_contexts()
         # PDU/assoc config
@@ -105,7 +127,9 @@ class OrthancCallbackHandler:
             self._network_timeout,
         )
         # Per-thread association reuse (faster and simpler than pooling)
-        self._per_thread_assoc = str(orthanc_config.get("per_thread_association", "true")).lower() not in ("false", "0", "no")
+        self._per_thread_assoc = str(
+            orthanc_config.get("per_thread_association", "true")
+        ).lower() not in ("false", "0", "no")
         self._tls = threading.local()
 
     class _AssociationPool:
@@ -227,9 +251,12 @@ class OrthancCallbackHandler:
             "1.2.840.10008.1.2.4.91",  # JPEG 2000
             "1.2.840.10008.1.2.4.50",  # JPEG Baseline
             "1.2.840.10008.1.2.4.51",  # JPEG Extended
-            "1.2.840.10008.1.2.5",     # RLE Lossless
+            "1.2.840.10008.1.2.5",  # RLE Lossless
         ]
-        syntaxes = compressed + [str(ExplicitVRLittleEndian), str(ImplicitVRLittleEndian)]
+        syntaxes = compressed + [
+            str(ExplicitVRLittleEndian),
+            str(ImplicitVRLittleEndian),
+        ]
         try:
             return [
                 build_context(cx.abstract_syntax, syntaxes)
@@ -256,7 +283,9 @@ class OrthancCallbackHandler:
                 if ts:
                     ordered.append(str(ts))
                 ordered.extend(compressed)
-                ordered.extend([str(ExplicitVRLittleEndian), str(ImplicitVRLittleEndian)])
+                ordered.extend(
+                    [str(ExplicitVRLittleEndian), str(ImplicitVRLittleEndian)]
+                )
                 # Deduplicate preserving order
                 seen = set()
                 prefer = [x for x in ordered if not (x in seen or seen.add(x))]
@@ -274,7 +303,9 @@ class OrthancCallbackHandler:
             ae.acse_timeout = self._acse_timeout
             ae.dimse_timeout = self._dimse_timeout
             ae.network_timeout = self._network_timeout
-            assoc: Association = ae.associate(self.xnat_ip, self.xnat_port, ae_title=self.xnat_ae_title)
+            assoc: Association = ae.associate(
+                self.xnat_ip, self.xnat_port, ae_title=self.xnat_ae_title
+            )
             if not assoc.is_established:
                 try:
                     ae.shutdown()
@@ -283,7 +314,7 @@ class OrthancCallbackHandler:
                 return False
             try:
                 status = assoc.send_c_store(ds)
-                code = getattr(status, 'Status', None)
+                code = getattr(status, "Status", None)
                 assoc.release()
                 return code == 0x0000
             finally:
@@ -306,7 +337,9 @@ class OrthancCallbackHandler:
             ae.acse_timeout = self._acse_timeout
             ae.dimse_timeout = self._dimse_timeout
             ae.network_timeout = self._network_timeout
-            assoc: Association = ae.associate(self.xnat_ip, self.xnat_port, ae_title=self.xnat_ae_title)
+            assoc: Association = ae.associate(
+                self.xnat_ip, self.xnat_port, ae_title=self.xnat_ae_title
+            )
             if assoc.is_established:
                 self._tls.assoc = assoc
                 self._tls.ae = ae
@@ -339,7 +372,9 @@ class OrthancCallbackHandler:
         except Exception:
             pass
 
-    def _send_dataset(self, ds: pydicom.Dataset, instance_id_str: Optional[str]) -> None:
+    def _send_dataset(
+        self, ds: pydicom.Dataset, instance_id_str: Optional[str]
+    ) -> None:
         """Send dataset using the I/O executor and clear retry counters on success."""
         ok = self.send_to_xnat(ds)
         if ok and instance_id_str:
@@ -375,7 +410,7 @@ class OrthancCallbackHandler:
                             a = self._get_thread_assoc()
                             if a is not None:
                                 st = a.send_c_store(new_ds)
-                                if getattr(st, 'Status', None) == 0x0000:
+                                if getattr(st, "Status", None) == 0x0000:
                                     return True
                         except Exception:
                             pass
@@ -394,7 +429,9 @@ class OrthancCallbackHandler:
                 try:
                     new_ds = self._ensure_uncompressed(ds)
                     if self._send_with_ephemeral_assoc(new_ds):
-                        orthanc.LogInfo("Successfully sent via uncompressed ephemeral association")
+                        orthanc.LogInfo(
+                            "Successfully sent via uncompressed ephemeral association"
+                        )
                         return True
                 except Exception:
                     pass
@@ -413,7 +450,7 @@ class OrthancCallbackHandler:
                     try:
                         new_ds = self._ensure_uncompressed(ds)
                         st2 = assoc.send_c_store(new_ds)
-                        if getattr(st2, 'Status', None) == 0x0000:
+                        if getattr(st2, "Status", None) == 0x0000:
                             self._assoc_pool.release(assoc)
                             return True
                     except Exception:
@@ -425,7 +462,7 @@ class OrthancCallbackHandler:
                 try:
                     new_ds = self._ensure_uncompressed(ds)
                     st3 = assoc.send_c_store(new_ds)
-                    if getattr(st3, 'Status', None) == 0x0000:
+                    if getattr(st3, "Status", None) == 0x0000:
                         self._assoc_pool.release(assoc)
                         return True
                 except Exception:
@@ -503,7 +540,9 @@ class OrthancCallbackHandler:
                 elif vr == "UI":
                     try:
                         val = str(elem.value)
-                        new = "".join(ch for ch in val if (ch.isdigit() or ch == "."))[:64]
+                        new = "".join(ch for ch in val if (ch.isdigit() or ch == "."))[
+                            :64
+                        ]
                         new = new.rstrip(".")
                         if new:
                             elem.value = new
@@ -565,6 +604,7 @@ class OrthancCallbackHandler:
             # Treat any non-string sequence (e.g., pydicom MultiValue) as a list of values
             try:
                 from collections.abc import Sequence as _Seq
+
                 if isinstance(v, _Seq) and not isinstance(v, (str, bytes)):
                     return [str(x) for x in v if x is not None and str(x) != ""]
             except Exception:
@@ -628,7 +668,11 @@ class OrthancCallbackHandler:
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", category=UserWarning)
-                    ds_hdr = pydicom.dcmread(io.BytesIO(dcm_bytes), stop_before_pixels=True, defer_size="1 KB")
+                    ds_hdr = pydicom.dcmread(
+                        io.BytesIO(dcm_bytes),
+                        stop_before_pixels=True,
+                        defer_size="1 KB",
+                    )
                 ds_hdr.filename = None
             except pydicom.errors.InvalidDicomError:
                 orthanc.LogError(f"Invalid DICOM instance: {instance}")
@@ -664,10 +708,73 @@ class OrthancCallbackHandler:
                 ds = pydicom.dcmread(io.BytesIO(dcm_bytes), defer_size="1 KB")
             ds.filename = None
 
-            # Deidentify and sanitize, then schedule send on I/O executor
-            deidentified_ds = self.dicom_processor.deidentify_dicom(ds, new_patient_id)
-            deidentified_ds = self._sanitize_dataset(deidentified_ds)
-            self.send_executor.submit(self._send_dataset, deidentified_ds, instance_id_str)
+            # Offload CPU-bound de-identification to process pool if available
+            if getattr(self, "_process_pool", None) is not None:
+                try:
+                    fut = self._process_pool.submit(
+                        processor_module.worker_deidentify_bytes,
+                        dcm_bytes,
+                        new_patient_id,
+                    )
+
+                    def _on_done(fut):
+                        try:
+                            deid_bytes = fut.result()
+                        except Exception as e:
+                            orthanc.LogError(
+                                f"Deid worker failed for instance {instance}: {e}"
+                            )
+                            # As a fallback, attempt local deid
+                            try:
+                                local_ds = self.dicom_processor.deidentify_dicom(
+                                    ds, new_patient_id
+                                )
+                                local_ds = self._sanitize_dataset(local_ds)
+                                self._submit_send(local_ds, instance_id_str)
+                            except Exception as ex:
+                                orthanc.LogError(f"Local deid fallback failed: {ex}")
+                            return
+                        # Convert bytes back to dataset and submit for send on IO executor
+                        try:
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", category=UserWarning)
+                                deid_ds = pydicom.dcmread(
+                                    io.BytesIO(deid_bytes), defer_size="1 KB"
+                                )
+                            deid_ds.filename = None
+                        except Exception as e:
+                            orthanc.LogError(
+                                f"Failed to read deid bytes for instance {instance}: {e}"
+                            )
+                            return
+                        # Sanitize and submit send
+                        try:
+                            deid_ds = self._sanitize_dataset(deid_ds)
+                            self._submit_send(deid_ds, instance_id_str)
+                        except Exception as e:
+                            orthanc.LogError(
+                                f"Failed to schedule send for instance {instance}: {e}"
+                            )
+
+                    # Schedule on IO executor to avoid running callback on worker thread
+                    self._io_executor.submit(lambda f=fut: _on_done(f))
+                except Exception as exc:
+                    orthanc.LogError(
+                        f"Failed to submit to process pool: {exc}; running deid locally"
+                    )
+                    # fallback to local deid
+                    deidentified_ds = self.dicom_processor.deidentify_dicom(
+                        ds, new_patient_id
+                    )
+                    deidentified_ds = self._sanitize_dataset(deidentified_ds)
+                    self._submit_send(deidentified_ds, instance_id_str)
+            else:
+                # No process pool available; do deid locally
+                deidentified_ds = self.dicom_processor.deidentify_dicom(
+                    ds, new_patient_id
+                )
+                deidentified_ds = self._sanitize_dataset(deidentified_ds)
+                self._submit_send(deidentified_ds, instance_id_str)
         except Exception as exc:  # pylint: disable=broad-except
             orthanc.LogError(
                 f"Unhandled exception while processing instance {instance}: {exc}"
@@ -676,6 +783,7 @@ class OrthancCallbackHandler:
     def _submit_send(self, ds: pydicom.Dataset, instance_id_str: Optional[str]) -> None:
         """Submit a send task to the IO executor with queue bounding."""
         self._io_submit_sema.acquire()
+
         def _run_send():
             try:
                 ok = self.send_to_xnat(ds)
@@ -689,11 +797,13 @@ class OrthancCallbackHandler:
                     self._io_submit_sema.release()
                 except Exception:
                     pass
+
         self._io_executor.submit(_run_send)
 
     def _submit_instance(self, instance_id: str) -> None:
         """Submit a processing task to the CPU executor with queue bounding."""
         self._submit_sema.acquire()
+
         def _run_process():
             try:
                 self.process_instance(instance_id)
@@ -702,6 +812,7 @@ class OrthancCallbackHandler:
                     self._submit_sema.release()
                 except Exception:
                     pass
+
         self.executor.submit(_run_process)
 
     def on_stored_instance(self, instance_id: str, *args, **kwargs) -> None:

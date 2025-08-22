@@ -5,6 +5,7 @@ import base64
 import hashlib
 from typing import Any, Optional
 from datetime import datetime
+import io  # added to support worker byte handling
 
 import pydicom
 import pydicom.sequence
@@ -507,3 +508,48 @@ class DicomProcessor:
         "SIEMENS": handle_siemens,
         "GE MEDICAL SYSTEMS": handle_ge,
     }
+
+
+# Worker utilities for ProcessPoolExecutor
+_worker_processor: Optional[DicomProcessor] = None
+
+def worker_init(config_dict: dict) -> None:
+    """Initializer for process pool workers. Builds a local DicomProcessor using a simple config wrapper."""
+    global _worker_processor
+
+    class _SimpleConfig:
+        def __init__(self, cfg: dict):
+            self.config = cfg
+
+        def get_orthanc_config(self) -> dict:
+            return self.config.get("orthanc", {})
+
+        def get_sheets(self) -> list:
+            return self.config.get("sheets", [])
+
+        def get_microsoft_config(self) -> dict:
+            return self.config.get("microsoft", {})
+
+    try:
+        _worker_processor = DicomProcessor(_SimpleConfig(config_dict))
+    except Exception:
+        _worker_processor = None
+
+
+def worker_deidentify_bytes(dcm_bytes: bytes, patient_id: str) -> bytes:
+    """De-identify dataset in worker process and return serialized bytes.
+
+    Expects worker_init to have been called in this process.
+    """
+    global _worker_processor
+    if _worker_processor is None:
+        raise RuntimeError("Worker not initialized: call worker_init first")
+
+    bio = io.BytesIO(dcm_bytes)
+    ds = pydicom.dcmread(bio, defer_size="1 KB")
+    ds.filename = None
+    deid_ds = _worker_processor.deidentify_dicom(ds, patient_id)
+    out = io.BytesIO()
+    # write_like_original=False ensures pydicom writes a valid file meta header
+    pydicom.dcmwrite(out, deid_ds, write_like_original=False)
+    return out.getvalue()

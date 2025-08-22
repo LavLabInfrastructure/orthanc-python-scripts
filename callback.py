@@ -606,6 +606,19 @@ class OrthancCallbackHandler:
                     pass
         self._io_executor.submit(_run_send)
 
+    def _submit_instance(self, instance_id: str) -> None:
+        """Submit a processing task to the CPU executor with queue bounding."""
+        self._submit_sema.acquire()
+        def _run_process():
+            try:
+                self.process_instance(instance_id)
+            finally:
+                try:
+                    self._submit_sema.release()
+                except Exception:
+                    pass
+        self.executor.submit(_run_process)
+
     def on_stored_instance(self, instance_id: str, *args, **kwargs) -> None:
         """Callback function triggered when a new instance is stored in Orthanc."""
         try:

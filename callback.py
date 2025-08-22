@@ -7,7 +7,7 @@ import time
 import warnings
 import re
 import ast
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Sequence
 
@@ -356,18 +356,84 @@ class OrthancCallbackHandler:
                         pass
                 elif vr == "SH":
                     try:
+                        s = str(elem.value)
+                        if len(s) > 16:
+                            orthanc.LogWarning(
+                                f"Trimming SH {getattr(elem, 'name', '') or elem.tag} from {len(s)} to 16"
+                            )
                         elem.value = _limit_len(elem.value, 16)
                     except Exception:
                         pass
                 elif vr == "LO":
                     try:
+                        s = str(elem.value)
+                        if len(s) > 64:
+                            orthanc.LogWarning(
+                                f"Trimming LO {getattr(elem, 'name', '') or elem.tag} from {len(s)} to 64"
+                            )
                         elem.value = _limit_len(elem.value, 64)
+                    except Exception:
+                        pass
+                elif vr == "UI":
+                    try:
+                        # Digits and dots only, max 64 chars, no trailing dot
+                        val = str(elem.value)
+                        new = "".join(ch for ch in val if (ch.isdigit() or ch == "."))[:64]
+                        new = new.rstrip(".")
+                        if new and new != val:
+                            orthanc.LogWarning(
+                                f"Normalizing UI {getattr(elem, 'name', '') or elem.tag}"
+                            )
+                        if new:
+                            elem.value = new
                     except Exception:
                         pass
         except Exception:
             # Best effort sanitization; ignore if iterating fails
             pass
         return ds
+
+    def _validate_before_send(self, ds: pydicom.Dataset) -> bool:
+        """Validate essential tags before sending to XNAT; fix trivially fixable issues.
+        Returns True if OK to send, False to skip.
+        """
+
+        def _is_valid_ui(s: Any) -> bool:
+            if not s:
+                return False
+            ss = str(s)
+            if len(ss) > 64:
+                return False
+            if ss.endswith("."):
+                return False
+            return all(ch.isdigit() or ch == "." for ch in ss)
+
+        required = [
+            "SOPClassUID",
+            "SOPInstanceUID",
+            "StudyInstanceUID",
+            "SeriesInstanceUID",
+        ]
+        ok = True
+        for tag in required:
+            val = ds.get(tag)
+            if not _is_valid_ui(val):
+                # Try to repair deterministically from whatever we have
+                base = f"{tag}:{ds.get('PatientID','')}:${ds.get('StudyDate','')}:{ds.get('Modality','')}:{ds.get('AccessionNumber','')}"
+                try:
+                    new_uid = DicomProcessor.hash_dicom_uid(base)
+                    setattr(ds, tag, new_uid)
+                    orthanc.LogWarning(f"Repaired invalid/missing {tag} -> {new_uid}")
+                except Exception:
+                    ok = False
+        # Minimal image consistency: if PixelData present, ensure Rows/Columns present
+        if hasattr(ds, "PixelData"):
+            if ds.get("Rows") is None or ds.get("Columns") is None:
+                orthanc.LogWarning(
+                    "Dataset has PixelData but missing Rows/Columns; skipping send"
+                )
+                ok = False
+        return ok
 
     def process_instance(self, instance: Union[orthanc.DicomInstance, str]) -> None:
         """Process a new DICOM instance by re-identifying and sending it to XNAT."""
@@ -430,8 +496,11 @@ class OrthancCallbackHandler:
             self._flush_pending_for_ids(all_ids)
 
             deidentified_ds = self.dicom_processor.deidentify_dicom(ds, new_patient_id)
-            # Sanitize again post-deid to enforce VR limits (e.g., SH<=16, LO<=64)
+            # Sanitize again post-deid to enforce VR limits (e.g., SH<=16, LO<=64, UI cleaned)
             deidentified_ds = self._sanitize_dataset(deidentified_ds)
+            # Validate essential tags to avoid sending non-parsable DICOMs
+            if not self._validate_before_send(deidentified_ds):
+                return
             orthanc.LogInfo(
                 f"Re-identified DICOM with new patient ID: {new_patient_id}"
             )

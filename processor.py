@@ -10,6 +10,8 @@ import pydicom
 import pydicom.sequence
 from deid.config import DeidRecipe
 from deid.dicom.parser import DicomParser
+from pydicom.datadict import dictionary_VR, tag_for_keyword  # added
+from pydicom.tag import Tag  # added
 
 # orthanc doesn't have a pypi package, so pylance complains about the import, works fine at runtime
 # if you want autocomplete, add orthanc.pyi to the directory, downloaded from the link below
@@ -59,6 +61,34 @@ class DicomProcessor:
         self._match_cache: dict[tuple, dict[str, Any]] = {}
         self._match_cache_max = 8192
 
+    def _set_with_vr(self, ds: pydicom.Dataset, keyword: str, val: Any) -> None:
+        """Set a DICOM attribute by keyword enforcing VR constraints (CS/SH/LO/UI)."""
+        try:
+            tag = tag_for_keyword(keyword)
+            if tag is None:
+                # Fallback to setattr, let pydicom coerce
+                setattr(ds, keyword, val)
+                return
+            vr = dictionary_VR(tag)
+        except Exception:
+            vr = None
+        s = str(val)
+        if vr == "CS":
+            allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _")
+            s = "".join(ch for ch in s.upper() if ch in allowed)[:16]
+        elif vr == "SH":
+            s = s[:16]
+        elif vr == "LO":
+            s = s[:64]
+        elif vr == "UI":
+            s = "".join(ch for ch in s if (ch.isdigit() or ch == "."))[:64]
+            s = s.rstrip(".")
+        try:
+            setattr(ds, keyword, s)
+        except Exception:
+            # Last resort, ignore
+            pass
+
     def deidentify_dicom(
         self,
         ds: pydicom.Dataset,
@@ -92,21 +122,103 @@ class DicomProcessor:
         parser.define("gather_diffusion_tags", self.gather_diffusion_tags)
         parser.define("round_func", self.deid_round_func)
 
-        parser.parse(strip_sequences=False, remove_private=False)
-        parser.remove_private()
-        return parser.dicom
+        try:
+            parser.parse(strip_sequences=False, remove_private=False)
+            parser.remove_private()
+            return parser.dicom
+        except Exception as exc:
+            # Robust fallback de-identification: apply critical replacements and continue
+            orthanc.LogError(f"Deid parser failed: {exc}; applying minimal fallback deid")
+            try:
+                # Core patient identifiers
+                self._set_with_vr(ds, "PatientName", patient_id)
+                self._set_with_vr(ds, "PatientID", patient_id)
+                # Age rounding if available
+                age = ds.get("PatientAge")
+                if age is not None:
+                    try:
+                        val = str(age).lower().strip("y")
+                        self._set_with_vr(
+                            ds,
+                            "PatientAge",
+                            f"{self.round_to_nearest_five(int(val)):03}Y",
+                        )
+                    except Exception:
+                        self._set_with_vr(ds, "PatientAge", "000Y")
+                # Common SH identifiers -> hashed 15
+                for kw in [
+                    "AccessionNumber",
+                    "AdmissionID",
+                    "InterpretationID",
+                    "PerformedProcedureStepID",
+                    "PerformingPhysicianName",
+                    "RequestedProcedureID",
+                    "ResultsID",
+                    "StudyID",
+                ]:
+                    orig = ds.get(kw)
+                    if orig is not None:
+                        h = DicomProcessor.hash(str(orig))[:15]
+                        self._set_with_vr(ds, kw, h)
+                # Hash UIDs deterministically
+                for kw in ["StudyInstanceUID", "SeriesInstanceUID"]:
+                    orig = ds.get(kw)
+                    base = (
+                        str(orig)
+                        if orig is not None
+                        else f"{kw}:{patient_id}:{ds.get('StudyDate','')}:{ds.get('Modality','')}"
+                    )
+                    self._set_with_vr(ds, kw, DicomProcessor.hash_dicom_uid(base))
+                # PatientComments route
+                try:
+                    route = self.format_xnat_route_antiphi(
+                        None,
+                        None,
+                        type("F", (), {"element": type("E", (), {"VR": "LO"})})(),
+                        ds,
+                    )
+                    self._set_with_vr(ds, "PatientComments", route)
+                except Exception:
+                    pass
+                # Remove private tags
+                ds.remove_private_tags()
+            except Exception:
+                pass
+            return ds
 
     def _coerce_for_vr(self, field, val: Any) -> str:
         """Coerce returned values to match the VR constraints of the target element.
         - SH: max 16 chars
         - LO: max 64 chars
         - CS: uppercased, allowed charset, max 16
+        - UI: digits and dots only, max 64, no trailing dot
         Falls back to str(val) if VR unavailable.
         """
+        # Try to determine VR from the field
+        vr = None
         try:
             vr = getattr(getattr(field, "element", None), "VR", None)
         except Exception:
             vr = None
+        if not vr:
+            # Try tag
+            try:
+                t = getattr(field, "tag", None)
+                if t is not None:
+                    vr = dictionary_VR(Tag(t))
+            except Exception:
+                pass
+        if not vr:
+            # Try keyword
+            try:
+                kw = getattr(field, "keyword", None)
+                if kw:
+                    tag = tag_for_keyword(kw)
+                    if tag is not None:
+                        vr = dictionary_VR(tag)
+            except Exception:
+                pass
+
         s = str(val)
         if vr == "CS":
             allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _")
@@ -115,15 +227,24 @@ class DicomProcessor:
             s = s[:16]
         elif vr == "LO":
             s = s[:64]
+        elif vr == "UI":
+            s = "".join(ch for ch in s if (ch.isdigit() or ch == "."))[:64]
+            s = s.rstrip(".")
         return s
 
     def deid_hash_uid_func(self, item, value, field, dicom) -> str:
         """Hash the provided value for UID fields."""
-        return self._coerce_for_vr(field, DicomProcessor.hash_dicom_uid(str(value)))
+        try:
+            return self._coerce_for_vr(field, DicomProcessor.hash_dicom_uid(str(value)))
+        except Exception:
+            return self._coerce_for_vr(field, "1.2.840.113619.0")
 
     def deid_hash_func(self, item, value, field, dicom) -> str:
         """Hash the provided value and truncate for general string fields."""
-        return self._coerce_for_vr(field, DicomProcessor.hash(str(value))[:15])
+        try:
+            return self._coerce_for_vr(field, DicomProcessor.hash(str(value))[:15])
+        except Exception:
+            return self._coerce_for_vr(field, "0" * 15)
 
     def format_xnat_route_antiphi(self, item, value, field, dicom):
         """
@@ -131,33 +252,36 @@ class DicomProcessor:
         This variant checks for KO and SR modalities and ConversionType
         to determine if the session is PHI.
         """
-
-        xnat_project = self.get_project(dicom)
-        # logic to remove icky stuff
-        modality = dicom.get("Modality")
-        if modality == "KO" or modality == "SR":
-            return "Project: NA Subject: HIDDEN Session: PROBABLE_PHI"
-        elif dicom.get("ConversionType") is not None:
-            return "Project: NA Subject: HIDDEN Session: PROBABLE_PHI"
-        sesh = (
-            f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
-        )
-
-        result = (
-            f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
-        )
-        return self._coerce_for_vr(field, result)
+        try:
+            xnat_project = self.get_project(dicom)
+            modality = dicom.get("Modality")
+            if modality == "KO" or modality == "SR":
+                return self._coerce_for_vr(field, "Project: NA Subject: HIDDEN Session: PROBABLE_PHI")
+            elif dicom.get("ConversionType") is not None:
+                return self._coerce_for_vr(field, "Project: NA Subject: HIDDEN Session: PROBABLE_PHI")
+            sesh = (
+                f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
+            )
+            result = (
+                f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
+            )
+            return self._coerce_for_vr(field, result)
+        except Exception:
+            return self._coerce_for_vr(field, "Project: NA Subject: HIDDEN Session: UNKNOWN")
 
     def format_xnat_route(self, item, value, field, dicom):
         """Formats the XNAT route and assigns to the given field."""
-        xnat_project = self.get_project(dicom)
-        sesh = (
-            f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
-        )
-        result = (
-            f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
-        )
-        return self._coerce_for_vr(field, result)
+        try:
+            xnat_project = self.get_project(dicom)
+            sesh = (
+                f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
+            )
+            result = (
+                f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
+            )
+            return self._coerce_for_vr(field, result)
+        except Exception:
+            return self._coerce_for_vr(field, "Project: NA Subject: HIDDEN Session: UNKNOWN")
 
     def get_project(self, ds: pydicom.Dataset):
         """Use matching sheet to determine XNAT project, with per-dataset caching."""
@@ -220,32 +344,21 @@ class DicomProcessor:
 
     def gather_diffusion_tags(self, item, value, field, dicom) -> pydicom.Dataset:
         """Gathers relevant diffusion info and formats into an MRDiffusionSequence."""
-        desc_val = dicom.get("SeriesDescription", "")
-        desc = str(desc_val).lower()
-        # Require either 'diffusion' OR 'dwi', and exclude ADC series
-        if (
-            (("diffusion" not in desc) and ("dwi" not in desc))
-            or "adc" in desc
-            or "apparent diffusion coefficient" in desc
-        ):
+        try:
+            desc_val = dicom.get('SeriesDescription', '')
+            desc = str(desc_val).lower()
+            if ((('diffusion' not in desc) and ('dwi' not in desc)) or
+                'adc' in desc or 'apparent diffusion coefficient' in desc):
+                return None
+            manufacturer = str(dicom.get('Manufacturer', '')).upper() if 'Manufacturer' in dicom else ''
+            if not manufacturer:
+                return None
+            handler = self.MANUFACTURER_HANDLERS.get(manufacturer)
+            if not handler:
+                return None
+            return handler(dicom)
+        except Exception:
             return None
-
-        manufacturer = (
-            str(dicom.get("Manufacturer", "")).upper()
-            if "Manufacturer" in dicom
-            else ""
-        )
-        if not manufacturer:
-            # Missing manufacturer; skip gracefully
-            return None
-
-        handler = self.MANUFACTURER_HANDLERS.get(manufacturer)
-        if not handler:
-            # Unsupported manufacturer; skip gracefully
-            return None
-
-        # Call the handler function to get DiffusionSequence
-        return handler(dicom)
 
     def deid_round_func(self, item, value, field, dicom) -> str:
         """Round age-like values to nearest 5 years, expressed as 'NNNY'."""

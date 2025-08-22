@@ -57,6 +57,9 @@ class OrthancCallbackHandler:
         io_workers = int(orthanc_config.get("io_max_workers", max_workers * 2) or (max_workers * 2))
         self.executor = ThreadPoolExecutor(max_workers=cpu_workers)
         self._io_executor = ThreadPoolExecutor(max_workers=io_workers)
+        # Dedicated send executor (I/O bound)
+        send_workers = int(orthanc_config.get("send_max_workers", max_workers) or max_workers)
+        self.send_executor = ThreadPoolExecutor(max_workers=send_workers)
         # Bound the number of queued tasks to protect memory over multi-day runs
         max_queue = int(orthanc_config.get("max_queue", 1000) or 1000)
         self._submit_sema = threading.Semaphore(max_queue)
@@ -78,8 +81,8 @@ class OrthancCallbackHandler:
         )
         # Prefer keeping images compressed end-to-end; include compressed syntaxes in contexts
         self._prefer_compressed = str(orthanc_config.get("prefer_compressed", "true")).lower() not in ("false", "0", "no")
-        # Build preferred contexts (uncompressed + compressed)
-        self._contexts_preferred = self._build_preferred_contexts()
+        # Memoize preferred contexts (compressed + uncompressed) and configure association pool
+        self._contexts_all_preferred = self._build_preferred_contexts()
         # PDU/assoc config
         self._assoc_pool_size = int(
             orthanc_config.get("assoc_pool_size", max_workers) or max_workers
@@ -94,14 +97,14 @@ class OrthancCallbackHandler:
             self.xnat_port,
             self.ae_title,
             self.xnat_ae_title,
-            self._contexts_preferred,
+            self._contexts_all_preferred,
             self._assoc_pool_size,
             self._max_pdu_size,
             self._acse_timeout,
             self._dimse_timeout,
             self._network_timeout,
         )
-        # Per-thread association reuse
+        # Per-thread association reuse (faster and simpler than pooling)
         self._per_thread_assoc = str(orthanc_config.get("per_thread_association", "true")).lower() not in ("false", "0", "no")
         self._tls = threading.local()
 
@@ -217,51 +220,50 @@ class OrthancCallbackHandler:
         return ds
 
     def _build_preferred_contexts(self):
-        """Presentation contexts including uncompressed and common compressed syntaxes."""
-        uncompressed = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
-        compressed_uids = [
-            "1.2.840.10008.1.2.4.50",  # JPEG Baseline (Process 1)
-            "1.2.840.10008.1.2.4.51",  # JPEG Extended (Process 2 & 4)
-            "1.2.840.10008.1.2.4.57",  # JPEG Lossless, Non-Hierarchical (Process 14)
-            "1.2.840.10008.1.2.4.70",  # JPEG Lossless, First-Order Prediction (Process 14 SV1)
-            "1.2.840.10008.1.2.4.80",  # JPEG-LS Lossless
-            "1.2.840.10008.1.2.4.81",  # JPEG-LS Near-lossless
+        """Requested contexts including common compressed syntaxes plus uncompressed fallbacks."""
+        compressed = [
+            "1.2.840.10008.1.2.4.70",  # JPEG Lossless, Non-Hierarchical, P14 SV1
             "1.2.840.10008.1.2.4.90",  # JPEG 2000 Lossless
             "1.2.840.10008.1.2.4.91",  # JPEG 2000
+            "1.2.840.10008.1.2.4.50",  # JPEG Baseline
+            "1.2.840.10008.1.2.4.51",  # JPEG Extended
+            "1.2.840.10008.1.2.5",     # RLE Lossless
         ]
+        syntaxes = compressed + [str(ExplicitVRLittleEndian), str(ImplicitVRLittleEndian)]
         try:
-            if self._prefer_compressed:
-                all_ts = list(uncompressed) + compressed_uids
-            else:
-                all_ts = list(uncompressed)
             return [
-                build_context(cx.abstract_syntax, all_ts)
+                build_context(cx.abstract_syntax, syntaxes)
                 for cx in StoragePresentationContexts
             ]
         except Exception:
             return StoragePresentationContexts
 
     def _requested_contexts_for_dataset(self, ds: pydicom.Dataset):
-        """Prefer SOP-specific context with preferred syntaxes (compressed if enabled)."""
+        """Prefer a single context matching the dataset SOP Class with preferred syntaxes including source TS."""
+        compressed = [
+            "1.2.840.10008.1.2.4.70",
+            "1.2.840.10008.1.2.4.90",
+            "1.2.840.10008.1.2.4.91",
+            "1.2.840.10008.1.2.4.50",
+            "1.2.840.10008.1.2.4.51",
+            "1.2.840.10008.1.2.5",
+        ]
         try:
             sop = getattr(ds, "SOPClassUID", None)
+            ts = getattr(getattr(ds, "file_meta", None), "TransferSyntaxUID", None)
             if sop:
-                uncompressed = [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
-                compressed_uids = [
-                    "1.2.840.10008.1.2.4.50",
-                    "1.2.840.10008.1.2.4.51",
-                    "1.2.840.10008.1.2.4.57",
-                    "1.2.840.10008.1.2.4.70",
-                    "1.2.840.10008.1.2.4.80",
-                    "1.2.840.10008.1.2.4.81",
-                    "1.2.840.10008.1.2.4.90",
-                    "1.2.840.10008.1.2.4.91",
-                ]
-                ts = list(uncompressed) + compressed_uids if self._prefer_compressed else list(uncompressed)
-                return [build_context(sop, ts)]
+                ordered = []
+                if ts:
+                    ordered.append(str(ts))
+                ordered.extend(compressed)
+                ordered.extend([str(ExplicitVRLittleEndian), str(ImplicitVRLittleEndian)])
+                # Deduplicate preserving order
+                seen = set()
+                prefer = [x for x in ordered if not (x in seen or seen.add(x))]
+                return [build_context(sop, prefer)]
         except Exception:
             pass
-        return self._contexts_preferred
+        return self._contexts_all_preferred
 
     def _send_with_ephemeral_assoc(self, ds: pydicom.Dataset) -> bool:
         """Send using a one-off association with SOP-specific contexts (no pool wait)."""
@@ -299,7 +301,7 @@ class OrthancCallbackHandler:
             if assoc is not None and assoc.is_established:
                 return assoc
             ae = AE(ae_title=self.ae_title)
-            ae.requested_contexts = self._contexts_preferred
+            ae.requested_contexts = self._contexts_all_preferred
             ae.maximum_pdu_size = self._max_pdu_size
             ae.acse_timeout = self._acse_timeout
             ae.dimse_timeout = self._dimse_timeout
@@ -337,11 +339,17 @@ class OrthancCallbackHandler:
         except Exception:
             pass
 
-    def send_to_xnat(self, ds: pydicom.Dataset) -> bool:
-        """Send the DICOM dataset to XNAT using C-STORE; prefer per-thread association reuse, with fallbacks."""
-        # Ensure uncompressed syntax for broader compatibility
-        ds = self._ensure_uncompressed(ds)
+    def _send_dataset(self, ds: pydicom.Dataset, instance_id_str: Optional[str]) -> None:
+        """Send dataset using the I/O executor and clear retry counters on success."""
+        ok = self.send_to_xnat(ds)
+        if ok and instance_id_str:
+            with self._pending_lock:
+                self._pending_retries.pop(instance_id_str, None)
 
+    def send_to_xnat(self, ds: pydicom.Dataset) -> bool:
+        """Send the DICOM dataset to XNAT using C-STORE; prefer per-thread association reuse, with fallbacks.
+        Tries original transfer syntax first; if negotiation fails, decompress and retry uncompressed.
+        """
         attempts = 0
         max_attempts = 3
         backoff = 0.5
@@ -357,22 +365,39 @@ class OrthancCallbackHandler:
                         if code == 0x0000:
                             orthanc.LogInfo("Successfully sent DICOM file to XNAT")
                             return True
-                        else:
-                            orthanc.LogError(f"C-STORE failed with status: {code}; dropping thread assoc")
-                            self._drop_thread_assoc()
-                    except Exception as exc:  # pylint: disable=broad-except
-                        orthanc.LogError(f"Exception during C-STORE: {exc}; dropping thread assoc")
+                        # If failed due to presentation context for current TS, decompress and retry once
                         self._drop_thread_assoc()
-                    # Retry loop will recreate assoc
+                    except Exception as exc:  # pylint: disable=broad-except
+                        msg = str(exc)
+                        # Try fallback: decompress and retry fresh assoc
+                        try:
+                            new_ds = self._ensure_uncompressed(ds)
+                            a = self._get_thread_assoc()
+                            if a is not None:
+                                st = a.send_c_store(new_ds)
+                                if getattr(st, 'Status', None) == 0x0000:
+                                    return True
+                        except Exception:
+                            pass
+                    # Retry loop will continue
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 5)
                     continue
             # Fallback to pool/ephemeral path
             assoc = self._assoc_pool.acquire(timeout=0.05)
             if assoc is None:
+                # Ephemeral try with preferred contexts
                 if self._send_with_ephemeral_assoc(ds):
                     orthanc.LogInfo("Successfully sent via ephemeral association")
                     return True
+                # Decompress and try ephemeral uncompressed
+                try:
+                    new_ds = self._ensure_uncompressed(ds)
+                    if self._send_with_ephemeral_assoc(new_ds):
+                        orthanc.LogInfo("Successfully sent via uncompressed ephemeral association")
+                        return True
+                except Exception:
+                    pass
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 5)
                 continue
@@ -384,9 +409,27 @@ class OrthancCallbackHandler:
                     orthanc.LogInfo("Successfully sent DICOM file to XNAT")
                     return True
                 else:
+                    # Try decompress on same association (it likely accepted uncompressed contexts too)
+                    try:
+                        new_ds = self._ensure_uncompressed(ds)
+                        st2 = assoc.send_c_store(new_ds)
+                        if getattr(st2, 'Status', None) == 0x0000:
+                            self._assoc_pool.release(assoc)
+                            return True
+                    except Exception:
+                        pass
                     orthanc.LogError(f"C-STORE failed with status: {code}")
                     self._assoc_pool.discard(assoc)
             except Exception as exc:  # pylint: disable=broad-except
+                # Decompress and retry once if possible
+                try:
+                    new_ds = self._ensure_uncompressed(ds)
+                    st3 = assoc.send_c_store(new_ds)
+                    if getattr(st3, 'Status', None) == 0x0000:
+                        self._assoc_pool.release(assoc)
+                        return True
+                except Exception:
+                    pass
                 orthanc.LogError(f"Exception during C-STORE: {exc}")
                 self._assoc_pool.discard(assoc)
             time.sleep(backoff)
@@ -512,6 +555,61 @@ class OrthancCallbackHandler:
                 ok = False
         return ok
 
+    def _extract_patient_ids(self, ds: pydicom.Dataset) -> List[str]:
+        """Extract possible alternate patient identifiers from standard fields.
+        Returns a list of candidate IDs (may be empty)."""
+
+        def _to_list(v) -> List[str]:
+            if v is None:
+                return []
+            # Treat any non-string sequence (e.g., pydicom MultiValue) as a list of values
+            try:
+                from collections.abc import Sequence as _Seq
+                if isinstance(v, _Seq) and not isinstance(v, (str, bytes)):
+                    return [str(x) for x in v if x is not None and str(x) != ""]
+            except Exception:
+                pass
+            s = str(v).strip()
+            # Try to parse Python-like list strings: "['A','B']"
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    lit = ast.literal_eval(s)
+                    if isinstance(lit, (list, tuple)):
+                        return [str(x) for x in lit if x is not None and str(x) != ""]
+                except Exception:
+                    pass
+            # Split by DICOM multi-valued delimiter (backslash)
+            if "\\" in s:
+                return [p.strip() for p in s.split("\\") if p.strip()]
+            # As a last resort, split by comma if present
+            if "," in s:
+                return [p.strip().strip("'\"") for p in s.split(",") if p.strip()]
+            return [s] if s else []
+
+        candidates: List[str] = []
+        # Primary ID(s)
+        candidates.extend(_to_list(ds.get("PatientID")))
+        # OtherPatientIDs may be multi-valued
+        candidates.extend(_to_list(ds.get("OtherPatientIDs")))
+        # OtherPatientIDsSequence items may contain IDs
+        seq = ds.get("OtherPatientIDsSequence")
+        if seq:
+            try:
+                for item in seq:
+                    candidates.extend(_to_list(item.get("PatientID")))
+                    candidates.extend(_to_list(item.get("ID")))
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                unique.append(c)
+        return unique
+
     def process_instance(self, instance: Union[orthanc.DicomInstance, str]) -> None:
         """Process a new DICOM instance by re-identifying and sending it to XNAT."""
         try:
@@ -526,8 +624,8 @@ class OrthancCallbackHandler:
                 orthanc.LogError(f"Could not get DICOM bytes for instance {instance}")
                 return
 
+            # Header-only fast read to avoid touching pixel data if we won't send
             try:
-                # Header-only parse for fast lookup; defer large attributes
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", category=UserWarning)
                     ds_hdr = pydicom.dcmread(io.BytesIO(dcm_bytes), stop_before_pixels=True, defer_size="1 KB")
@@ -536,7 +634,7 @@ class OrthancCallbackHandler:
                 orthanc.LogError(f"Invalid DICOM instance: {instance}")
                 return
 
-            # Use header for matching and key extraction
+            # Use header dataset for matching and mapping
             sheet = self.dicom_processor.match_dicom_to_sheet(ds_hdr)
             formatting = sheet.get("format", "{}")
             all_ids = self._extract_patient_ids(ds_hdr)
@@ -554,35 +652,22 @@ class OrthancCallbackHandler:
 
             new_patient_id = self.excel_client.get_patient_id(key, sheet, alt_keys)
             if not new_patient_id or key == new_patient_id:
-                # No mapping yet; queue for retry and return without fully parsing image
                 self._queue_pending_instance(all_ids, instance_id_str)
                 orthanc.LogWarning(
                     f"No mapping found yet for IDs {all_ids}; queued instance for retry"
                 )
                 return
 
-            # Mapping discovered; seed cache for all observed IDs and retry any pending
-            try:
-                formatted_ids = [formatting.format(i) for i in all_ids if i]
-                self.excel_client.set_mapping(sheet, formatted_ids, new_patient_id)
-            except Exception:  # pylint: disable=broad-except
-                pass
-            self._flush_pending_for_ids(all_ids)
-
-            # Re-read full dataset for deid/send
+            # Full read only when we plan to send; still defer large attributes where possible
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=UserWarning)
-                ds_full = pydicom.dcmread(io.BytesIO(dcm_bytes))
-            ds_full.filename = None
+                ds = pydicom.dcmread(io.BytesIO(dcm_bytes), defer_size="1 KB")
+            ds.filename = None
 
-            deidentified_ds = self.dicom_processor.deidentify_dicom(ds_full, new_patient_id)
-            # Sanitize once post-deid
+            # Deidentify and sanitize, then schedule send on I/O executor
+            deidentified_ds = self.dicom_processor.deidentify_dicom(ds, new_patient_id)
             deidentified_ds = self._sanitize_dataset(deidentified_ds)
-            # Validate essential tags
-            if not self._validate_before_send(deidentified_ds):
-                return
-            # Submit send on IO executor
-            self._submit_send(deidentified_ds, instance_id_str)
+            self.send_executor.submit(self._send_dataset, deidentified_ds, instance_id_str)
         except Exception as exc:  # pylint: disable=broad-except
             orthanc.LogError(
                 f"Unhandled exception while processing instance {instance}: {exc}"

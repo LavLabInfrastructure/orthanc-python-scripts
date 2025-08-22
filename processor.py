@@ -128,7 +128,9 @@ class DicomProcessor:
             return parser.dicom
         except Exception as exc:
             # Robust fallback de-identification: apply critical replacements and continue
-            orthanc.LogError(f"Deid parser failed: {exc}; applying minimal fallback deid")
+            orthanc.LogError(
+                f"Deid parser failed: {exc}; applying minimal fallback deid"
+            )
             try:
                 # Core patient identifiers
                 self._set_with_vr(ds, "PatientName", patient_id)
@@ -256,32 +258,32 @@ class DicomProcessor:
             xnat_project = self.get_project(dicom)
             modality = dicom.get("Modality")
             if modality == "KO" or modality == "SR":
-                return self._coerce_for_vr(field, "Project: NA Subject: HIDDEN Session: PROBABLE_PHI")
+                return self._coerce_for_vr(
+                    field, "Project: NA Subject: HIDDEN Session: PROBABLE_PHI"
+                )
             elif dicom.get("ConversionType") is not None:
-                return self._coerce_for_vr(field, "Project: NA Subject: HIDDEN Session: PROBABLE_PHI")
-            sesh = (
-                f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
-            )
-            result = (
-                f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
-            )
+                return self._coerce_for_vr(
+                    field, "Project: NA Subject: HIDDEN Session: PROBABLE_PHI"
+                )
+            sesh = f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
+            result = f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
             return self._coerce_for_vr(field, result)
         except Exception:
-            return self._coerce_for_vr(field, "Project: NA Subject: HIDDEN Session: UNKNOWN")
+            return self._coerce_for_vr(
+                field, "Project: NA Subject: HIDDEN Session: UNKNOWN"
+            )
 
     def format_xnat_route(self, item, value, field, dicom):
         """Formats the XNAT route and assigns to the given field."""
         try:
             xnat_project = self.get_project(dicom)
-            sesh = (
-                f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
-            )
-            result = (
-                f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
-            )
+            sesh = f"{dicom.get('PatientID')}_{dicom.get('StudyDate')}_{dicom.get('Modality')}"
+            result = f"Project: {xnat_project} Subject: {dicom.get('PatientID')} Session: {sesh}"
             return self._coerce_for_vr(field, result)
         except Exception:
-            return self._coerce_for_vr(field, "Project: NA Subject: HIDDEN Session: UNKNOWN")
+            return self._coerce_for_vr(
+                field, "Project: NA Subject: HIDDEN Session: UNKNOWN"
+            )
 
     def get_project(self, ds: pydicom.Dataset):
         """Use matching sheet to determine XNAT project, with per-dataset caching."""
@@ -345,12 +347,19 @@ class DicomProcessor:
     def gather_diffusion_tags(self, item, value, field, dicom) -> pydicom.Dataset:
         """Gathers relevant diffusion info and formats into an MRDiffusionSequence."""
         try:
-            desc_val = dicom.get('SeriesDescription', '')
+            desc_val = dicom.get("SeriesDescription", "")
             desc = str(desc_val).lower()
-            if ((('diffusion' not in desc) and ('dwi' not in desc)) or
-                'adc' in desc or 'apparent diffusion coefficient' in desc):
+            if (
+                (("diffusion" not in desc) and ("dwi" not in desc))
+                or "adc" in desc
+                or "apparent diffusion coefficient" in desc
+            ):
                 return None
-            manufacturer = str(dicom.get('Manufacturer', '')).upper() if 'Manufacturer' in dicom else ''
+            manufacturer = (
+                str(dicom.get("Manufacturer", "")).upper()
+                if "Manufacturer" in dicom
+                else ""
+            )
             if not manufacturer:
                 return None
             handler = self.MANUFACTURER_HANDLERS.get(manufacturer)
@@ -377,8 +386,6 @@ class DicomProcessor:
             out = dt.strftime("%Y%m01")
         except Exception:
             out = str(value)
-        # Cannot access self here (static), so SH/LO/CS cannot be enforced via helper.
-        # Rely on post-deid sanitization in callback.
         return out
 
     @staticmethod

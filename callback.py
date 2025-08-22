@@ -52,10 +52,10 @@ class OrthancCallbackHandler:
         self.excel_client = excel_client
 
         # Reusable, bounded worker pool to avoid spawning unbounded threads
-        max_workers = int(orthanc_config.get("max_workers", 8) or 8)
+        max_workers = int(orthanc_config.get("max_workers", 12) or 12)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         # Bound the number of queued tasks to protect memory over multi-day runs
-        max_queue = int(orthanc_config.get("max_queue", 1000) or 1000)
+        max_queue = int(orthanc_config.get("max_queue", 1000000) or 1000000)
         self._submit_sema = threading.Semaphore(max_queue)
         # Ensure only one /sync-all runs at a time
         self._sync_all_lock = threading.Lock()
@@ -73,8 +73,12 @@ class OrthancCallbackHandler:
         )
         # Memoize uncompressed presentation contexts and configure association pool
         self._contexts_all_uncompressed = self._build_uncompressed_contexts()
-        self._max_pdu_size = int(orthanc_config.get("max_pdu_size", 262144) or 262144)
-        self._assoc_pool_size = int(orthanc_config.get("assoc_pool_size", 4) or 4)
+        # Default pool size to max_workers to avoid throttling throughput
+        self._assoc_pool_size = int(
+            orthanc_config.get("assoc_pool_size", max_workers) or max_workers
+        )
+        # Use a larger default PDU; negotiated down by peer as needed
+        self._max_pdu_size = int(orthanc_config.get("max_pdu_size", 4194304) or 4194304)
         self._acse_timeout = int(orthanc_config.get("acse_timeout", 30) or 30)
         self._dimse_timeout = int(orthanc_config.get("dimse_timeout", 60) or 60)
         self._network_timeout = int(orthanc_config.get("network_timeout", 30) or 30)
@@ -93,6 +97,7 @@ class OrthancCallbackHandler:
 
     class _AssociationPool:
         """Thread-safe pool of persistent pynetdicom associations."""
+
         def __init__(
             self,
             ip: str,
@@ -128,7 +133,9 @@ class OrthancCallbackHandler:
                 ae.acse_timeout = self._acse
                 ae.dimse_timeout = self._dimse
                 ae.network_timeout = self._net
-                assoc: Association = ae.associate(self._ip, self._port, ae_title=self._peer)
+                assoc: Association = ae.associate(
+                    self._ip, self._port, ae_title=self._peer
+                )
                 if assoc.is_established:
                     # attach AE so we can shutdown when discarding
                     setattr(assoc, "_lavlab_ae", ae)
@@ -143,9 +150,9 @@ class OrthancCallbackHandler:
                 orthanc.LogError(f"Failed to create association: {exc}")
                 return None
 
-        def acquire(self, timeout: float = 5.0) -> Optional[Association]:
-            """Get an established association or create one if capacity allows."""
-            end = time.time() + timeout
+        def acquire(self, timeout: float = 0.0) -> Optional[Association]:
+            """Get an established association or create one; blocks if pool is full and none available when timeout<=0."""
+            end = None if timeout <= 0 else (time.time() + timeout)
             while True:
                 with self._lock:
                     if self._available:
@@ -159,11 +166,10 @@ class OrthancCallbackHandler:
                         if assoc is not None:
                             self._total += 1
                             return assoc
-                        # creation failed, loop and retry until timeout
                 # outside lock
-                if time.time() >= end:
+                if end is not None and time.time() >= end:
                     return None
-                time.sleep(0.05)
+                time.sleep(0.01)
 
         def release(self, assoc: Association) -> None:
             with self._lock:
@@ -248,7 +254,8 @@ class OrthancCallbackHandler:
         backoff = 1.0
         while attempts < max_attempts:
             attempts += 1
-            assoc = self._assoc_pool.acquire(timeout=5.0)
+            # Block until an association is available to avoid backoff thrash
+            assoc = self._assoc_pool.acquire(timeout=0)
             if assoc is None:
                 orthanc.LogError("No association available to send C-STORE")
                 time.sleep(backoff)
@@ -256,7 +263,6 @@ class OrthancCallbackHandler:
                 continue
             try:
                 status = assoc.send_c_store(ds)
-                # status is a pydicom Dataset; success is 0x0000
                 code = getattr(status, "Status", None)
                 if code == 0x0000:
                     self._assoc_pool.release(assoc)
@@ -482,7 +488,9 @@ class OrthancCallbackHandler:
                     try:
                         # Digits and dots only, max 64 chars, no trailing dot
                         val = str(elem.value)
-                        new = "".join(ch for ch in val if (ch.isdigit() or ch == "."))[:64]
+                        new = "".join(ch for ch in val if (ch.isdigit() or ch == "."))[
+                            :64
+                        ]
                         new = new.rstrip(".")
                         if new and new != val:
                             orthanc.LogWarning(
@@ -563,9 +571,6 @@ class OrthancCallbackHandler:
                 orthanc.LogError(f"Invalid DICOM instance: {instance}")
                 return
 
-            # Sanitize common VR issues before further processing
-            ds = self._sanitize_dataset(ds)
-
             sheet = self.dicom_processor.match_dicom_to_sheet(ds)
             formatting = sheet.get("format", "{}")
             # Build primary key and alternates from DICOM
@@ -600,7 +605,7 @@ class OrthancCallbackHandler:
             self._flush_pending_for_ids(all_ids)
 
             deidentified_ds = self.dicom_processor.deidentify_dicom(ds, new_patient_id)
-            # Sanitize again post-deid to enforce VR limits (e.g., SH<=16, LO<=64, UI cleaned)
+            # Sanitize once post-deid
             deidentified_ds = self._sanitize_dataset(deidentified_ds)
             # Validate essential tags to avoid sending non-parsable DICOMs
             if not self._validate_before_send(deidentified_ds):
